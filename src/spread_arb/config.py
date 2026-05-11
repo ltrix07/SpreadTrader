@@ -31,8 +31,8 @@ class Settings(BaseSettings):
     max_open_positions: int = Field(default=3, ge=1)
     one_position_per_symbol: bool = True
     symbol_cooldown_sec: int = Field(default=60, ge=0)
-    min_raw_spread_pct: float = Field(default=0.45, ge=0)
-    entry_net_spread_pct: float = Field(default=0.25, ge=0)
+    min_raw_spread_pct: float = Field(default=0.45)
+    entry_net_spread_pct: float = Field(default=0.25)
     exit_spread_pct: float = Field(default=0.05, ge=0)
     stop_spread_pct: float = Field(default=0.80, ge=0)
     max_hold_seconds: int = Field(default=900, ge=1)
