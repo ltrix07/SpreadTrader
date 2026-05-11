@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from collections import Counter
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -26,6 +27,9 @@ class QuoteScanner:
         self.last_quote_at: dict[tuple[ExchangeName, str], datetime] = {}
         self.latest_quotes: dict[tuple[ExchangeName, str], Quote] = {}
         self.latest_best_opportunity_by_symbol: dict[str, SpreadOpportunity] = {}
+        self.latest_raw_spread_by_symbol: dict[str, SpreadOpportunity] = {}
+        self.rejection_counts: Counter[str] = Counter()
+        self.total_scans: int = 0
         self.opportunity_store: OpportunityStore | None = None
         self.paper_engine: PaperEngine | None = None
 
@@ -70,6 +74,7 @@ class QuoteScanner:
                 ]
                 stale_task = asyncio.create_task(self._monitor_stale_quotes(), name="stale-monitor")
                 spread_task = asyncio.create_task(self._log_top_spreads(), name="spread-monitor")
+                quote_health_task = asyncio.create_task(self._log_quote_health(), name="quote-health")
                 paper_summary_task = asyncio.create_task(
                     self.paper_engine.summary_loop(self.stop_event),
                     name="paper-summary",
@@ -77,10 +82,11 @@ class QuoteScanner:
 
                 await self.stop_event.wait()
 
-                for task in [*poll_tasks, stale_task, spread_task, paper_summary_task]:
+                bg_tasks = [*poll_tasks, stale_task, spread_task, quote_health_task, paper_summary_task]
+                for task in bg_tasks:
                     task.cancel()
 
-                await asyncio.gather(*poll_tasks, stale_task, spread_task, paper_summary_task, return_exceptions=True)
+                await asyncio.gather(*bg_tasks, return_exceptions=True)
                 await self.paper_engine.shutdown()
                 self.log.info("scanner stopped")
         self.opportunity_store = None
@@ -107,24 +113,40 @@ class QuoteScanner:
         if len(symbol_quotes) < 2:
             return
 
-        evaluated: list[SpreadOpportunity] = []
+        self.total_scans += 1
+        all_spreads: list[SpreadOpportunity] = []
+
         for first_exchange, second_exchange in combinations(symbol_quotes.keys(), 2):
             first_quote = symbol_quotes[first_exchange]
             second_quote = symbol_quotes[second_exchange]
 
             forward = self._evaluate_direction(long_quote=first_quote, short_quote=second_quote)
             if forward is not None:
-                evaluated.append(forward)
-                self._record_opportunity(forward)
+                all_spreads.append(forward)
+                if forward.reason:
+                    self.rejection_counts[forward.reason] += 1
+                # Only record to DB if passed raw spread filter (avoid flooding).
+                if forward.raw_spread_pct >= self.settings.min_raw_spread_pct:
+                    self._record_opportunity(forward)
 
             reverse = self._evaluate_direction(long_quote=second_quote, short_quote=first_quote)
             if reverse is not None:
-                evaluated.append(reverse)
-                self._record_opportunity(reverse)
+                all_spreads.append(reverse)
+                if reverse.reason:
+                    self.rejection_counts[reverse.reason] += 1
+                if reverse.raw_spread_pct >= self.settings.min_raw_spread_pct:
+                    self._record_opportunity(reverse)
 
-        if evaluated:
+        # Diagnostic: always track best raw spread per symbol (regardless of filters).
+        if all_spreads:
+            best_raw = max(all_spreads, key=lambda item: item.raw_spread_pct)
+            self.latest_raw_spread_by_symbol[symbol] = best_raw
+
+        # Paper engine: only track observed opportunities.
+        observed = [s for s in all_spreads if s.status == "observed"]
+        if observed:
             self.latest_best_opportunity_by_symbol[symbol] = max(
-                evaluated,
+                observed,
                 key=lambda item: item.estimated_net_spread_pct,
             )
 
@@ -136,8 +158,6 @@ class QuoteScanner:
             return None
 
         raw_spread_pct = float((bid_short - ask_long) / ask_long * Decimal("100"))
-        if raw_spread_pct < self.settings.min_raw_spread_pct:
-            return None
 
         now = datetime.now(UTC)
         quote_age_ms_long = (now - long_quote.received_at).total_seconds() * 1000.0
@@ -159,14 +179,19 @@ class QuoteScanner:
             and short_notional_capacity >= self.settings.paper_notional_usdt
         )
 
-        decision = classify_opportunity(
-            estimated_net_spread_pct=estimated_net_spread_pct,
-            entry_net_spread_pct=self.settings.entry_net_spread_pct,
-            is_fresh=is_fresh,
-            is_liquid=is_liquid,
-        )
-        status = decision.status
-        reason = decision.reason
+        # Classify: raw spread threshold checked first, then fine-grained filters.
+        if raw_spread_pct < self.settings.min_raw_spread_pct:
+            status = "rejected"
+            reason = "raw_spread_below_min"
+        else:
+            decision = classify_opportunity(
+                estimated_net_spread_pct=estimated_net_spread_pct,
+                entry_net_spread_pct=self.settings.entry_net_spread_pct,
+                is_fresh=is_fresh,
+                is_liquid=is_liquid,
+            )
+            status = decision.status
+            reason = decision.reason
 
         return SpreadOpportunity(
             symbol=long_quote.symbol,
@@ -267,20 +292,74 @@ class QuoteScanner:
         interval_sec = self.settings.top_spreads_log_interval_sec
 
         while not self.stop_event.is_set():
-            if self.latest_best_opportunity_by_symbol:
+            # Show ALL raw spreads (including sub-threshold) sorted by raw spread.
+            if self.latest_raw_spread_by_symbol:
                 top = sorted(
-                    self.latest_best_opportunity_by_symbol.values(),
-                    key=lambda item: item.estimated_net_spread_pct,
+                    self.latest_raw_spread_by_symbol.values(),
+                    key=lambda item: item.raw_spread_pct,
                     reverse=True,
-                )[:5]
-                formatted = " | ".join(
-                    f"{item.symbol} {item.long_exchange.value}->{item.short_exchange.value} "
-                    f"raw={item.raw_spread_pct:.3f}% net={item.estimated_net_spread_pct:.3f}% "
-                    f"status={item.status}"
-                    f"{f' reason={item.reason}' if item.reason else ''}"
+                )[:10]
+                lines = [
+                    f"  {item.symbol:<16s} "
+                    f"{item.long_exchange.value}->{item.short_exchange.value}  "
+                    f"raw={item.raw_spread_pct:+.4f}%  "
+                    f"net={item.estimated_net_spread_pct:+.4f}%  "
+                    f"cost={item.estimated_roundtrip_cost_pct:.4f}%  "
+                    f"age_l={item.quote_age_ms_long:.0f}ms  "
+                    f"age_s={item.quote_age_ms_short:.0f}ms  "
+                    f"[{item.status}{f':{item.reason}' if item.reason else ''}]"
                     for item in top
+                ]
+                self.log.info("top raw spreads (all, best direction per symbol):\n%s", "\n".join(lines))
+
+            # Rejection breakdown.
+            if self.rejection_counts:
+                breakdown = " | ".join(
+                    f"{reason}={count}" for reason, count in self.rejection_counts.most_common()
                 )
-                self.log.info("top spreads | %s", formatted)
+                self.log.info(
+                    "rejections (cumulative) | %s | total_scans=%d",
+                    breakdown,
+                    self.total_scans,
+                )
+
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=interval_sec)
+            except TimeoutError:
+                continue
+
+    async def _log_quote_health(self) -> None:
+        interval_sec = 10.0
+
+        while not self.stop_event.is_set():
+            if self.latest_quotes:
+                now = datetime.now(UTC)
+                lines: list[str] = []
+                for (exchange, symbol), quote in sorted(
+                    self.latest_quotes.items(),
+                    key=lambda x: (x[0][1], x[0][0].value),
+                ):
+                    age_ms = (now - quote.received_at).total_seconds() * 1000.0
+                    stale_marker = " STALE" if age_ms > self.settings.max_quote_age_ms else ""
+                    inner_spread_bps = (
+                        float(
+                            (quote.best_ask_price - quote.best_bid_price)
+                            / quote.best_ask_price
+                            * Decimal("10000")
+                        )
+                        if quote.best_ask_price > 0
+                        else 0.0
+                    )
+                    lines.append(
+                        f"  {symbol:<16s} {exchange.value:<6s}  "
+                        f"bid={str(quote.best_bid_price):<14s}  "
+                        f"ask={str(quote.best_ask_price):<14s}  "
+                        f"bbo_bps={inner_spread_bps:6.1f}  "
+                        f"age={age_ms:7.0f}ms  "
+                        f"lat={quote.receive_latency_ms:5.0f}ms"
+                        f"{stale_marker}"
+                    )
+                self.log.info("quote health:\n%s", "\n".join(lines))
 
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=interval_sec)

@@ -1,0 +1,6 @@
+aiohttp>=3.10.0
+pydantic>=2.8.0
+pydantic-settings>=2.4.0
+
+[dev]
+pytest>=8.0

@@ -37,11 +37,20 @@ class ExchangeClient(ABC):
     ) -> None:
         while not stop_event.is_set():
             try:
-                for symbol in symbols:
-                    quote = await self.fetch_quote(symbol)
-                    callback_result = on_quote(quote)
+                # Fetch all symbols concurrently to minimise quote staleness.
+                results = await asyncio.gather(
+                    *(self.fetch_quote(symbol) for symbol in symbols),
+                    return_exceptions=True,
+                )
+
+                for symbol, result in zip(symbols, results):
+                    if isinstance(result, BaseException):
+                        self.log.warning("fetch error for %s: %s", symbol, result)
+                        continue
+                    callback_result = on_quote(result)
                     if isinstance(callback_result, Awaitable):
                         await callback_result
+
                 await asyncio.wait_for(stop_event.wait(), timeout=poll_interval_sec)
             except TimeoutError:
                 continue
