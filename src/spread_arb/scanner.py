@@ -1,0 +1,324 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import signal
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from decimal import Decimal
+from itertools import combinations
+
+import aiohttp
+
+from .config import Settings
+from .exchanges import BybitExchange, ExchangeClient, MexcExchange
+from .models import ExchangeName, Quote
+from .opportunity import SpreadOpportunity, classify_opportunity
+from .paper_engine import PaperEngine
+from .storage import OpportunityRecord, OpportunityStore
+
+
+class QuoteScanner:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.log = logging.getLogger(__name__)
+        self.stop_event = asyncio.Event()
+        self.last_quote_at: dict[tuple[ExchangeName, str], datetime] = {}
+        self.latest_quotes: dict[tuple[ExchangeName, str], Quote] = {}
+        self.latest_best_opportunity_by_symbol: dict[str, SpreadOpportunity] = {}
+        self.opportunity_store: OpportunityStore | None = None
+        self.paper_engine: PaperEngine | None = None
+
+        self.exchange_fees_pct: dict[ExchangeName, float] = {
+            ExchangeName.MEXC: self.settings.taker_fee_mexc_pct,
+            ExchangeName.BYBIT: self.settings.taker_fee_bybit_pct,
+        }
+
+    async def run(self) -> None:
+        self._install_signal_handlers()
+
+        timeout = aiohttp.ClientTimeout(total=self.settings.request_timeout_sec)
+        with OpportunityStore(self.settings.database_url) as self.opportunity_store:
+            self.paper_engine = PaperEngine(
+                settings=self.settings,
+                opportunity_store=self.opportunity_store,
+                get_latest_quote=self._get_latest_quote,
+            )
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                exchanges = self._build_exchanges(session)
+                if not exchanges:
+                    raise RuntimeError("No exchanges configured")
+
+                self.log.info(
+                    "starting quote scanner | exchanges=%s symbols=%s",
+                    [exchange.name.value for exchange in exchanges],
+                    self.settings.symbols,
+                )
+
+                poll_tasks = [
+                    asyncio.create_task(
+                        exchange.poll(
+                            symbols=self.settings.symbols,
+                            on_quote=self._on_quote,
+                            stop_event=self.stop_event,
+                            poll_interval_sec=self.settings.poll_interval_sec,
+                            reconnect_backoff_sec=self.settings.reconnect_backoff_sec,
+                        ),
+                        name=f"poll-{exchange.name.value}",
+                    )
+                    for exchange in exchanges
+                ]
+                stale_task = asyncio.create_task(self._monitor_stale_quotes(), name="stale-monitor")
+                spread_task = asyncio.create_task(self._log_top_spreads(), name="spread-monitor")
+                paper_summary_task = asyncio.create_task(
+                    self.paper_engine.summary_loop(self.stop_event),
+                    name="paper-summary",
+                )
+
+                await self.stop_event.wait()
+
+                for task in [*poll_tasks, stale_task, spread_task, paper_summary_task]:
+                    task.cancel()
+
+                await asyncio.gather(*poll_tasks, stale_task, spread_task, paper_summary_task, return_exceptions=True)
+                await self.paper_engine.shutdown()
+                self.log.info("scanner stopped")
+        self.opportunity_store = None
+        self.paper_engine = None
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    async def _on_quote(self, quote: Quote) -> None:
+        key = (quote.exchange, quote.symbol)
+        self.last_quote_at[key] = quote.received_at
+        self.latest_quotes[key] = quote
+        self._scan_symbol(quote.symbol)
+        if self.paper_engine is not None:
+            self.paper_engine.on_quote_tick()
+
+    def _scan_symbol(self, symbol: str) -> None:
+        symbol_quotes = {
+            exchange: quote
+            for (exchange, quote_symbol), quote in self.latest_quotes.items()
+            if quote_symbol == symbol
+        }
+
+        if len(symbol_quotes) < 2:
+            return
+
+        evaluated: list[SpreadOpportunity] = []
+        for first_exchange, second_exchange in combinations(symbol_quotes.keys(), 2):
+            first_quote = symbol_quotes[first_exchange]
+            second_quote = symbol_quotes[second_exchange]
+
+            forward = self._evaluate_direction(long_quote=first_quote, short_quote=second_quote)
+            if forward is not None:
+                evaluated.append(forward)
+                self._record_opportunity(forward)
+
+            reverse = self._evaluate_direction(long_quote=second_quote, short_quote=first_quote)
+            if reverse is not None:
+                evaluated.append(reverse)
+                self._record_opportunity(reverse)
+
+        if evaluated:
+            self.latest_best_opportunity_by_symbol[symbol] = max(
+                evaluated,
+                key=lambda item: item.estimated_net_spread_pct,
+            )
+
+    def _evaluate_direction(self, *, long_quote: Quote, short_quote: Quote) -> SpreadOpportunity | None:
+        ask_long = long_quote.best_ask_price
+        bid_short = short_quote.best_bid_price
+
+        if ask_long <= Decimal("0"):
+            return None
+
+        raw_spread_pct = float((bid_short - ask_long) / ask_long * Decimal("100"))
+        if raw_spread_pct < self.settings.min_raw_spread_pct:
+            return None
+
+        now = datetime.now(UTC)
+        quote_age_ms_long = (now - long_quote.received_at).total_seconds() * 1000.0
+        quote_age_ms_short = (now - short_quote.received_at).total_seconds() * 1000.0
+
+        fee_long = self.exchange_fees_pct.get(long_quote.exchange, 0.0)
+        fee_short = self.exchange_fees_pct.get(short_quote.exchange, 0.0)
+        estimated_roundtrip_cost_pct = (2.0 * fee_long) + (2.0 * fee_short)
+        estimated_roundtrip_cost_pct += self.settings.slippage_buffer_pct + self.settings.safety_buffer_pct
+        estimated_net_spread_pct = raw_spread_pct - estimated_roundtrip_cost_pct
+
+        max_age_ms = self.settings.max_quote_age_ms
+        is_fresh = quote_age_ms_long <= max_age_ms and quote_age_ms_short <= max_age_ms
+
+        long_notional_capacity = float(long_quote.best_ask_price * long_quote.best_ask_size)
+        short_notional_capacity = float(short_quote.best_bid_price * short_quote.best_bid_size)
+        is_liquid = (
+            long_notional_capacity >= self.settings.paper_notional_usdt
+            and short_notional_capacity >= self.settings.paper_notional_usdt
+        )
+
+        decision = classify_opportunity(
+            estimated_net_spread_pct=estimated_net_spread_pct,
+            entry_net_spread_pct=self.settings.entry_net_spread_pct,
+            is_fresh=is_fresh,
+            is_liquid=is_liquid,
+        )
+        status = decision.status
+        reason = decision.reason
+
+        return SpreadOpportunity(
+            symbol=long_quote.symbol,
+            long_exchange=long_quote.exchange,
+            short_exchange=short_quote.exchange,
+            ask_long=float(long_quote.best_ask_price),
+            bid_short=float(short_quote.best_bid_price),
+            raw_spread_pct=raw_spread_pct,
+            estimated_net_spread_pct=estimated_net_spread_pct,
+            estimated_roundtrip_cost_pct=estimated_roundtrip_cost_pct,
+            available_long_size=float(long_quote.best_ask_size),
+            available_short_size=float(short_quote.best_bid_size),
+            quote_age_ms_long=quote_age_ms_long,
+            quote_age_ms_short=quote_age_ms_short,
+            notional_usdt=self.settings.paper_notional_usdt,
+            status=status,
+            reason=reason,
+            timestamp=now,
+        )
+
+    def _record_opportunity(self, opportunity: SpreadOpportunity) -> None:
+        if self.opportunity_store is None:
+            return
+
+        record = OpportunityRecord(
+            timestamp=opportunity.timestamp.isoformat(),
+            symbol=opportunity.symbol,
+            long_exchange=opportunity.long_exchange.value,
+            short_exchange=opportunity.short_exchange.value,
+            ask_long=opportunity.ask_long,
+            bid_short=opportunity.bid_short,
+            raw_spread_pct=opportunity.raw_spread_pct,
+            estimated_net_spread_pct=opportunity.estimated_net_spread_pct,
+            estimated_roundtrip_cost_pct=opportunity.estimated_roundtrip_cost_pct,
+            available_long_size=opportunity.available_long_size,
+            available_short_size=opportunity.available_short_size,
+            quote_age_ms_long=opportunity.quote_age_ms_long,
+            quote_age_ms_short=opportunity.quote_age_ms_short,
+            notional_usdt=opportunity.notional_usdt,
+            status=opportunity.status,
+            reason=opportunity.reason,
+            created_at=OpportunityStore.now_iso(),
+        )
+        opportunity.opportunity_id = self.opportunity_store.insert_opportunity(record)
+
+        if opportunity.status == "observed":
+            self.log.info(
+                "observed | %s | long=%s ask=%.6f | short=%s bid=%.6f | raw=%.4f%% | net=%.4f%% | cost=%.4f%%",
+                opportunity.symbol,
+                opportunity.long_exchange.value,
+                opportunity.ask_long,
+                opportunity.short_exchange.value,
+                opportunity.bid_short,
+                opportunity.raw_spread_pct,
+                opportunity.estimated_net_spread_pct,
+                opportunity.estimated_roundtrip_cost_pct,
+            )
+            if self.paper_engine is not None:
+                self.paper_engine.on_observed_opportunity(opportunity)
+        else:
+            self.log.debug(
+                "rejected | %s | long=%s short=%s | raw=%.4f%% | net=%.4f%% | reason=%s",
+                opportunity.symbol,
+                opportunity.long_exchange.value,
+                opportunity.short_exchange.value,
+                opportunity.raw_spread_pct,
+                opportunity.estimated_net_spread_pct,
+                opportunity.reason,
+            )
+
+    def _get_latest_quote(self, exchange: ExchangeName, symbol: str) -> Quote | None:
+        return self.latest_quotes.get((exchange, symbol))
+
+    async def _monitor_stale_quotes(self) -> None:
+        interval_sec = max(self.settings.max_quote_age_ms / 1000.0 / 2.0, 0.5)
+
+        while not self.stop_event.is_set():
+            now = datetime.now(UTC)
+            max_age_ms = self.settings.max_quote_age_ms
+            for key, ts in self.last_quote_at.items():
+                age_ms = (now - ts).total_seconds() * 1000.0
+                if age_ms > max_age_ms:
+                    exchange, symbol = key
+                    self.log.warning(
+                        "stale quote detected | %s | %s | age_ms=%.0f > max=%d",
+                        exchange.value,
+                        symbol,
+                        age_ms,
+                        max_age_ms,
+                    )
+
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=interval_sec)
+            except TimeoutError:
+                continue
+
+    async def _log_top_spreads(self) -> None:
+        interval_sec = self.settings.top_spreads_log_interval_sec
+
+        while not self.stop_event.is_set():
+            if self.latest_best_opportunity_by_symbol:
+                top = sorted(
+                    self.latest_best_opportunity_by_symbol.values(),
+                    key=lambda item: item.estimated_net_spread_pct,
+                    reverse=True,
+                )[:5]
+                formatted = " | ".join(
+                    f"{item.symbol} {item.long_exchange.value}->{item.short_exchange.value} "
+                    f"raw={item.raw_spread_pct:.3f}% net={item.estimated_net_spread_pct:.3f}% "
+                    f"status={item.status}"
+                    f"{f' reason={item.reason}' if item.reason else ''}"
+                    for item in top
+                )
+                self.log.info("top spreads | %s", formatted)
+
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=interval_sec)
+            except TimeoutError:
+                continue
+
+    def _build_exchanges(self, session: aiohttp.ClientSession) -> list[ExchangeClient]:
+        by_name: dict[ExchangeName, type[ExchangeClient]] = {
+            ExchangeName.MEXC: MexcExchange,
+            ExchangeName.BYBIT: BybitExchange,
+        }
+
+        result: list[ExchangeClient] = []
+        for exchange_name in self.settings.exchanges:
+            factory = by_name.get(exchange_name)
+            if factory is None:
+                self.log.warning("unknown exchange in config, skipping: %s", exchange_name)
+                continue
+            result.append(factory(session=session, request_timeout_sec=self.settings.request_timeout_sec))
+        return result
+
+    def _install_signal_handlers(self) -> None:
+        loop = asyncio.get_running_loop()
+
+        def _request_shutdown(sig_name: str) -> None:
+            self.log.info("received %s, shutting down", sig_name)
+            self.stop()
+
+        for sig in _supported_signals():
+            try:
+                loop.add_signal_handler(sig, lambda s=sig: _request_shutdown(s.name))
+            except NotImplementedError:
+                # On some Windows event loops add_signal_handler is unavailable.
+                pass
+
+
+def _supported_signals() -> Iterable[signal.Signals]:
+    available = [signal.SIGINT]
+    if hasattr(signal, "SIGTERM"):
+        available.append(signal.SIGTERM)
+    return available

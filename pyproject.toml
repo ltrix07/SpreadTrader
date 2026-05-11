@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spread-arb-scanner"
+version = "0.1.0"
+description = "Inter-exchange spread scanner and paper execution logger (Phase 0/1 MVP)"
+requires-python = ">=3.12"
+dependencies = [
+  "aiohttp>=3.10.0",
+  "pydantic>=2.8.0",
+  "pydantic-settings>=2.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
