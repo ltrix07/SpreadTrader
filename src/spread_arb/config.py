@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from functools import lru_cache
+from typing import Any
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,6 +16,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        enable_decoding=False,
     )
 
     app_env: str = "dev"
@@ -47,12 +50,40 @@ class Settings(BaseSettings):
     reconnect_backoff_sec: float = Field(default=2.0, gt=0)
     top_spreads_log_interval_sec: float = Field(default=5.0, gt=0)
 
-    @field_validator("exchanges", "symbols", mode="before")
-    @classmethod
-    def _split_csv(cls, value: object) -> object:
+    @staticmethod
+    def _parse_list_env(value: Any) -> list[str] | Any:
         if isinstance(value, str):
-            return [item.strip() for item in value.split(",") if item.strip()]
+            raw = value.strip()
+            if not raw:
+                return []
+            if raw.startswith("[") and raw.endswith("]"):
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    parsed = raw
+                else:
+                    if isinstance(parsed, list):
+                        return [str(item).strip() for item in parsed if str(item).strip()]
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
         return value
+
+    @field_validator("exchanges", mode="before")
+    @classmethod
+    def _parse_exchanges(cls, value: Any) -> Any:
+        parsed = cls._parse_list_env(value)
+        if isinstance(parsed, list):
+            return [item.lower() for item in parsed]
+        return parsed
+
+    @field_validator("symbols", mode="before")
+    @classmethod
+    def _parse_symbols(cls, value: Any) -> Any:
+        parsed = cls._parse_list_env(value)
+        if isinstance(parsed, list):
+            return [item.upper() for item in parsed]
+        return parsed
 
 
 @lru_cache(maxsize=1)

@@ -31,6 +31,12 @@ def run_command() -> None:
     configure_logging(settings.log_level)
     logger = logging.getLogger(__name__)
 
+    logger.info(
+        "effective config | exchanges=%s | symbols=%s",
+        [exchange.value for exchange in settings.exchanges],
+        settings.symbols,
+    )
+
     db_path = init_sqlite(settings.database_url)
     logger.info("sqlite initialized at %s", db_path)
 
@@ -43,4 +49,3 @@ def run_command() -> None:
 
 if __name__ == "__main__":
     main()
-
