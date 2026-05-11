@@ -10,6 +10,7 @@ from .base import ExchangeClient
 
 class MexcExchange(ExchangeClient):
     base_url = "https://contract.mexc.com"
+    max_concurrent_requests = 5  # MEXC rate-limits aggressively on contract API.
 
     @property
     def name(self) -> ExchangeName:

@@ -25,7 +25,13 @@ class Settings(BaseSettings):
 
     exchanges: list[ExchangeName] = Field(default_factory=lambda: [ExchangeName.MEXC, ExchangeName.BYBIT])
     market_type: str = "perp"
-    symbols: list[Symbol] = Field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
+    symbols: list[Symbol] = Field(default_factory=lambda: [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+        "ADAUSDT", "AVAXUSDT", "LINKUSDT", "APTUSDT", "ARBUSDT",
+        "OPUSDT", "SUIUSDT", "SEIUSDT", "WIFUSDT", "PEPEUSDT",
+        "FLOKIUSDT", "INJUSDT", "NEARUSDT", "ORDIUSDT",
+        "1000BONKUSDT", "1000SHIBUSDT",
+    ])
 
     paper_notional_usdt: float = Field(default=100.0, gt=0)
     max_open_positions: int = Field(default=3, ge=1)

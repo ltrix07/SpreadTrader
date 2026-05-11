@@ -13,6 +13,10 @@ QuoteCallback = Callable[[Quote], Awaitable[None] | None]
 
 
 class ExchangeClient(ABC):
+    # Maximum number of concurrent HTTP requests per poll cycle.
+    # Override in subclasses with stricter rate limits (e.g. MEXC).
+    max_concurrent_requests: int = 20
+
     def __init__(self, session: ClientSession, request_timeout_sec: float = 8.0) -> None:
         self.session = session
         self.request_timeout_sec = request_timeout_sec
@@ -35,11 +39,17 @@ class ExchangeClient(ABC):
         poll_interval_sec: float,
         reconnect_backoff_sec: float,
     ) -> None:
+        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+
+        async def _guarded_fetch(symbol: Symbol) -> Quote:
+            async with semaphore:
+                return await self.fetch_quote(symbol)
+
         while not stop_event.is_set():
             try:
-                # Fetch all symbols concurrently to minimise quote staleness.
+                # Fetch all symbols concurrently (bounded by semaphore).
                 results = await asyncio.gather(
-                    *(self.fetch_quote(symbol) for symbol in symbols),
+                    *(_guarded_fetch(symbol) for symbol in symbols),
                     return_exceptions=True,
                 )
 
