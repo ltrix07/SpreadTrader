@@ -30,7 +30,7 @@ class Settings(BaseSettings):
         "ADAUSDT", "AVAXUSDT", "LINKUSDT", "APTUSDT", "ARBUSDT",
         "OPUSDT", "SUIUSDT", "SEIUSDT", "WIFUSDT", "PEPEUSDT",
         "FLOKIUSDT", "INJUSDT", "NEARUSDT", "ORDIUSDT",
-        "1000BONKUSDT", "1000SHIBUSDT",
+        "1000BONKUSDT",
     ])
 
     paper_notional_usdt: float = Field(default=100.0, gt=0)

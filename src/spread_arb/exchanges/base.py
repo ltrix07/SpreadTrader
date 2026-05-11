@@ -13,9 +13,10 @@ QuoteCallback = Callable[[Quote], Awaitable[None] | None]
 
 
 class ExchangeClient(ABC):
-    # Maximum number of concurrent HTTP requests per poll cycle.
+    # Delay between launching each request in a poll cycle (seconds).
+    # Staggers requests to avoid burst rate-limit hits.
     # Override in subclasses with stricter rate limits (e.g. MEXC).
-    max_concurrent_requests: int = 20
+    inter_request_delay_sec: float = 0.0
 
     def __init__(self, session: ClientSession, request_timeout_sec: float = 8.0) -> None:
         self.session = session
@@ -39,17 +40,21 @@ class ExchangeClient(ABC):
         poll_interval_sec: float,
         reconnect_backoff_sec: float,
     ) -> None:
-        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+        delay = self.inter_request_delay_sec
 
-        async def _guarded_fetch(symbol: Symbol) -> Quote:
-            async with semaphore:
-                return await self.fetch_quote(symbol)
+        async def _delayed_fetch(symbol: Symbol, offset: float) -> Quote:
+            if offset > 0:
+                await asyncio.sleep(offset)
+            return await self.fetch_quote(symbol)
 
         while not stop_event.is_set():
             try:
-                # Fetch all symbols concurrently (bounded by semaphore).
+                # Launch requests staggered by inter_request_delay_sec.
+                # With delay=0 all fire at once (Bybit-style).
+                # With delay=0.12 and 20 symbols: first at t=0, last at t=2.3s,
+                # requests naturally overlap but never burst.
                 results = await asyncio.gather(
-                    *(_guarded_fetch(symbol) for symbol in symbols),
+                    *(_delayed_fetch(symbol, i * delay) for i, symbol in enumerate(symbols)),
                     return_exceptions=True,
                 )
 

@@ -10,7 +10,7 @@ from .base import ExchangeClient
 
 class MexcExchange(ExchangeClient):
     base_url = "https://contract.mexc.com"
-    max_concurrent_requests = 5  # MEXC rate-limits aggressively on contract API.
+    inter_request_delay_sec = 0.12  # ~120ms between requests to stay under MEXC rate limit.
 
     @property
     def name(self) -> ExchangeName:
