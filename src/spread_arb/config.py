@@ -29,11 +29,22 @@ class Settings(BaseSettings):
     ])
     market_type: str = "perp"
     symbols: list[Symbol] = Field(default_factory=lambda: [
+        # ── Large caps (baseline, tight spreads) ──
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+        # ── Mid caps ──
         "ADAUSDT", "AVAXUSDT", "LINKUSDT", "APTUSDT", "ARBUSDT",
         "OPUSDT", "SUIUSDT", "SEIUSDT", "WIFUSDT", "PEPEUSDT",
         "FLOKIUSDT", "INJUSDT", "NEARUSDT", "ORDIUSDT",
         "1000BONKUSDT",
+        # ── Established mid-caps (likely wider spreads on smaller exchanges) ──
+        "DOTUSDT", "ATOMUSDT", "FILUSDT", "UNIUSDT", "LDOUSDT",
+        "AAVEUSDT", "GRTUSDT", "RUNEUSDT", "TIAUSDT", "STXUSDT",
+        # ── Newer / lower liquidity (potentially widest spreads) ──
+        "FETUSDT", "PENDLEUSDT", "JUPUSDT", "ENAUSDT", "ONDOUSDT",
+        "ZKUSDT", "STRKUSDT", "BLURUSDT", "DYDXUSDT", "GALAUSDT",
+        "CFXUSDT", "IMXUSDT", "GMXUSDT", "MASKUSDT", "WOOUSDT",
+        # ── Small / meme (max spread potential) ──
+        "ACHUSDT", "CELOUSDT", "LRCUSDT", "SKLUSDT", "ZENUSDT",
     ])
 
     paper_notional_usdt: float = Field(default=100.0, gt=0)
@@ -46,7 +57,7 @@ class Settings(BaseSettings):
     stop_spread_pct: float = Field(default=0.80, ge=0)
     max_hold_seconds: int = Field(default=900, ge=1)
     simulated_execution_delay_ms: int = Field(default=500, ge=0)
-    max_quote_age_ms: int = Field(default=5000, ge=1)
+    max_quote_age_ms: int = Field(default=8000, ge=1)
     slippage_buffer_pct: float = Field(default=0.05, ge=0)
     safety_buffer_pct: float = Field(default=0.05, ge=0)
 
