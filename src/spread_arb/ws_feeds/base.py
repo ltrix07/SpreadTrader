@@ -37,6 +37,9 @@ class WebSocketFeed(ABC):
         self.on_quote = on_quote
         self.log = logging.getLogger(f"{__name__}.{self.name.value}")
         self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._msg_count: int = 0
+        self._quote_count: int = 0
+        self._sample_logged: bool = False
 
     @property
     @abstractmethod
@@ -75,7 +78,7 @@ class WebSocketFeed(ABC):
         return False
 
     async def run(self, stop_event: asyncio.Event) -> None:
-        """Main loop: connect → subscribe → read messages → reconnect on error."""
+        """Main loop: connect -> subscribe -> read messages -> reconnect on error."""
         backoff = self.reconnect_base_sec
 
         while not stop_event.is_set():
@@ -102,6 +105,9 @@ class WebSocketFeed(ABC):
             receive_timeout=self.ping_interval_sec * 3,
         ) as ws:
             self._ws = ws
+            self._msg_count = 0
+            self._quote_count = 0
+            self._sample_logged = False
             self.log.info("connected, subscribing to %d symbols", len(self.symbols))
 
             # Send subscription messages.
@@ -110,18 +116,27 @@ class WebSocketFeed(ABC):
                 # Small delay between subscribe batches to avoid rate limits.
                 await asyncio.sleep(0.1)
 
-            # Start ping task.
+            # Start ping task and stats task.
             ping_task = asyncio.create_task(
                 self._ping_loop(ws, stop_event),
                 name=f"ws-ping-{self.name.value}",
+            )
+            stats_task = asyncio.create_task(
+                self._stats_loop(stop_event),
+                name=f"ws-stats-{self.name.value}",
             )
 
             try:
                 await self._read_loop(ws, stop_event)
             finally:
                 ping_task.cancel()
+                stats_task.cancel()
                 try:
                     await ping_task
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    await stats_task
                 except asyncio.CancelledError:
                     pass
                 self._ws = None
@@ -158,6 +173,14 @@ class WebSocketFeed(ABC):
             if self._is_pong(raw):
                 continue
 
+            self._msg_count += 1
+
+            # Log first non-ping/pong message as a sample for debugging.
+            if not self._sample_logged:
+                sample = str(raw)[:500] if isinstance(raw, str) else str(raw[:500])
+                self.log.info("first data message sample: %s", sample)
+                self._sample_logged = True
+
             try:
                 quote = self._parse_message(raw)
             except Exception as exc:  # noqa: BLE001
@@ -165,12 +188,28 @@ class WebSocketFeed(ABC):
                 continue
 
             if quote is not None:
+                self._quote_count += 1
                 try:
                     callback_result = self.on_quote(quote)
                     if isinstance(callback_result, Awaitable):
                         await callback_result
                 except Exception as exc:  # noqa: BLE001
                     self.log.warning("on_quote callback error: %s", exc)
+
+    async def _stats_loop(self, stop_event: asyncio.Event) -> None:
+        """Periodically log message/quote counters for debugging."""
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=30.0)
+                return
+            except TimeoutError:
+                pass
+            self.log.info(
+                "ws stats | msgs=%d quotes=%d (%.1f%% parsed)",
+                self._msg_count,
+                self._quote_count,
+                (self._quote_count / self._msg_count * 100) if self._msg_count else 0,
+            )
 
     async def _ping_loop(
         self,
