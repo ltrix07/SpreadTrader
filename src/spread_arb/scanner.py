@@ -12,7 +12,7 @@ from itertools import combinations
 import aiohttp
 
 from .config import Settings
-from .exchanges import BybitExchange, ExchangeClient, MexcExchange
+from .exchanges import BybitExchange, ExchangeClient, MexcExchange, OkxExchange
 from .models import ExchangeName, Quote
 from .opportunity import SpreadOpportunity, classify_opportunity
 from .paper_engine import PaperEngine
@@ -36,6 +36,7 @@ class QuoteScanner:
         self.exchange_fees_pct: dict[ExchangeName, float] = {
             ExchangeName.MEXC: self.settings.taker_fee_mexc_pct,
             ExchangeName.BYBIT: self.settings.taker_fee_bybit_pct,
+            ExchangeName.OKX: self.settings.taker_fee_okx_pct,
         }
 
     async def run(self) -> None:
@@ -370,6 +371,7 @@ class QuoteScanner:
         by_name: dict[ExchangeName, type[ExchangeClient]] = {
             ExchangeName.MEXC: MexcExchange,
             ExchangeName.BYBIT: BybitExchange,
+            ExchangeName.OKX: OkxExchange,
         }
 
         result: list[ExchangeClient] = []

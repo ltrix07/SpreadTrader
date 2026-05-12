@@ -16,6 +16,7 @@ Symbol = Annotated[
 class ExchangeName(StrEnum):
     MEXC = "mexc"
     BYBIT = "bybit"
+    OKX = "okx"
 
 
 class Quote(BaseModel):
