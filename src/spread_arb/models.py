@@ -17,6 +17,10 @@ class ExchangeName(StrEnum):
     MEXC = "mexc"
     BYBIT = "bybit"
     OKX = "okx"
+    BINANCE = "binance"
+    GATE = "gate"
+    BITGET = "bitget"
+    HTX = "htx"
 
 
 class Quote(BaseModel):

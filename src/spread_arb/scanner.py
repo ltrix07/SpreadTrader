@@ -12,7 +12,16 @@ from itertools import combinations
 import aiohttp
 
 from .config import Settings
-from .exchanges import BybitExchange, ExchangeClient, MexcExchange, OkxExchange
+from .exchanges import (
+    BinanceExchange,
+    BitgetExchange,
+    BybitExchange,
+    ExchangeClient,
+    GateExchange,
+    HtxExchange,
+    MexcExchange,
+    OkxExchange,
+)
 from .models import ExchangeName, Quote
 from .opportunity import SpreadOpportunity, classify_opportunity
 from .paper_engine import PaperEngine
@@ -37,6 +46,10 @@ class QuoteScanner:
             ExchangeName.MEXC: self.settings.taker_fee_mexc_pct,
             ExchangeName.BYBIT: self.settings.taker_fee_bybit_pct,
             ExchangeName.OKX: self.settings.taker_fee_okx_pct,
+            ExchangeName.BINANCE: self.settings.taker_fee_binance_pct,
+            ExchangeName.GATE: self.settings.taker_fee_gate_pct,
+            ExchangeName.BITGET: self.settings.taker_fee_bitget_pct,
+            ExchangeName.HTX: self.settings.taker_fee_htx_pct,
         }
 
     async def run(self) -> None:
@@ -372,6 +385,10 @@ class QuoteScanner:
             ExchangeName.MEXC: MexcExchange,
             ExchangeName.BYBIT: BybitExchange,
             ExchangeName.OKX: OkxExchange,
+            ExchangeName.BINANCE: BinanceExchange,
+            ExchangeName.GATE: GateExchange,
+            ExchangeName.BITGET: BitgetExchange,
+            ExchangeName.HTX: HtxExchange,
         }
 
         result: list[ExchangeClient] = []

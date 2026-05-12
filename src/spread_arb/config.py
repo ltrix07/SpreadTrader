@@ -23,7 +23,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     database_url: str = "sqlite+aiosqlite:///data/spread_arb.sqlite3"
 
-    exchanges: list[ExchangeName] = Field(default_factory=lambda: [ExchangeName.OKX, ExchangeName.BYBIT])
+    exchanges: list[ExchangeName] = Field(default_factory=lambda: [
+        ExchangeName.OKX, ExchangeName.BYBIT, ExchangeName.BINANCE,
+        ExchangeName.GATE, ExchangeName.BITGET, ExchangeName.HTX,
+    ])
     market_type: str = "perp"
     symbols: list[Symbol] = Field(default_factory=lambda: [
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
@@ -43,7 +46,7 @@ class Settings(BaseSettings):
     stop_spread_pct: float = Field(default=0.80, ge=0)
     max_hold_seconds: int = Field(default=900, ge=1)
     simulated_execution_delay_ms: int = Field(default=500, ge=0)
-    max_quote_age_ms: int = Field(default=1500, ge=1)
+    max_quote_age_ms: int = Field(default=5000, ge=1)
     slippage_buffer_pct: float = Field(default=0.05, ge=0)
     safety_buffer_pct: float = Field(default=0.05, ge=0)
 
@@ -51,6 +54,9 @@ class Settings(BaseSettings):
     taker_fee_bybit_pct: float = Field(default=0.055, ge=0)
     taker_fee_binance_pct: float = Field(default=0.05, ge=0)
     taker_fee_okx_pct: float = Field(default=0.05, ge=0)
+    taker_fee_gate_pct: float = Field(default=0.05, ge=0)
+    taker_fee_bitget_pct: float = Field(default=0.05, ge=0)
+    taker_fee_htx_pct: float = Field(default=0.05, ge=0)
 
     poll_interval_sec: float = Field(default=1.0, gt=0)
     request_timeout_sec: float = Field(default=8.0, gt=0)
