@@ -26,6 +26,15 @@ from .models import ExchangeName, Quote
 from .opportunity import SpreadOpportunity, classify_opportunity
 from .paper_engine import PaperEngine
 from .storage import OpportunityRecord, OpportunityStore
+from .ws_feeds import (
+    BinanceWsFeed,
+    BitgetWsFeed,
+    BybitWsFeed,
+    GateWsFeed,
+    HtxWsFeed,
+    OkxWsFeed,
+    WebSocketFeed,
+)
 
 
 class QuoteScanner:
@@ -63,29 +72,23 @@ class QuoteScanner:
                 get_latest_quote=self._get_latest_quote,
             )
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                exchanges = self._build_exchanges(session)
-                if not exchanges:
+                if self.settings.use_websocket:
+                    data_tasks = self._start_ws_feeds(session)
+                    mode = "websocket"
+                else:
+                    data_tasks = self._start_rest_polls(session)
+                    mode = "REST"
+
+                if not data_tasks:
                     raise RuntimeError("No exchanges configured")
 
                 self.log.info(
-                    "starting quote scanner | exchanges=%s symbols=%s",
-                    [exchange.name.value for exchange in exchanges],
-                    self.settings.symbols,
+                    "starting quote scanner [%s] | exchanges=%s symbols=%d",
+                    mode,
+                    [e.value for e in self.settings.exchanges],
+                    len(self.settings.symbols),
                 )
 
-                poll_tasks = [
-                    asyncio.create_task(
-                        exchange.poll(
-                            symbols=self.settings.symbols,
-                            on_quote=self._on_quote,
-                            stop_event=self.stop_event,
-                            poll_interval_sec=self.settings.poll_interval_sec,
-                            reconnect_backoff_sec=self.settings.reconnect_backoff_sec,
-                        ),
-                        name=f"poll-{exchange.name.value}",
-                    )
-                    for exchange in exchanges
-                ]
                 stale_task = asyncio.create_task(self._monitor_stale_quotes(), name="stale-monitor")
                 spread_task = asyncio.create_task(self._log_top_spreads(), name="spread-monitor")
                 quote_health_task = asyncio.create_task(self._log_quote_health(), name="quote-health")
@@ -96,7 +99,7 @@ class QuoteScanner:
 
                 await self.stop_event.wait()
 
-                bg_tasks = [*poll_tasks, stale_task, spread_task, quote_health_task, paper_summary_task]
+                bg_tasks = [*data_tasks, stale_task, spread_task, quote_health_task, paper_summary_task]
                 for task in bg_tasks:
                     task.cancel()
 
@@ -379,6 +382,53 @@ class QuoteScanner:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=interval_sec)
             except TimeoutError:
                 continue
+
+    def _start_ws_feeds(self, session: aiohttp.ClientSession) -> list[asyncio.Task]:
+        """Create WebSocket feed tasks for all configured exchanges."""
+        ws_factory: dict[ExchangeName, type[WebSocketFeed]] = {
+            ExchangeName.OKX: OkxWsFeed,
+            ExchangeName.BYBIT: BybitWsFeed,
+            ExchangeName.BINANCE: BinanceWsFeed,
+            ExchangeName.GATE: GateWsFeed,
+            ExchangeName.BITGET: BitgetWsFeed,
+            ExchangeName.HTX: HtxWsFeed,
+        }
+
+        tasks: list[asyncio.Task] = []
+        for exchange_name in self.settings.exchanges:
+            feed_cls = ws_factory.get(exchange_name)
+            if feed_cls is None:
+                self.log.warning("no WS feed for exchange %s, skipping", exchange_name)
+                continue
+            feed = feed_cls(
+                session=session,
+                symbols=self.settings.symbols,
+                on_quote=self._on_quote,
+            )
+            tasks.append(
+                asyncio.create_task(
+                    feed.run(self.stop_event),
+                    name=f"ws-{exchange_name.value}",
+                )
+            )
+        return tasks
+
+    def _start_rest_polls(self, session: aiohttp.ClientSession) -> list[asyncio.Task]:
+        """Create REST polling tasks for all configured exchanges (legacy mode)."""
+        exchanges = self._build_exchanges(session)
+        return [
+            asyncio.create_task(
+                exchange.poll(
+                    symbols=self.settings.symbols,
+                    on_quote=self._on_quote,
+                    stop_event=self.stop_event,
+                    poll_interval_sec=self.settings.poll_interval_sec,
+                    reconnect_backoff_sec=self.settings.reconnect_backoff_sec,
+                ),
+                name=f"poll-{exchange.name.value}",
+            )
+            for exchange in exchanges
+        ]
 
     def _build_exchanges(self, session: aiohttp.ClientSession) -> list[ExchangeClient]:
         by_name: dict[ExchangeName, type[ExchangeClient]] = {

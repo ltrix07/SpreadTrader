@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     stop_spread_pct: float = Field(default=0.80, ge=0)
     max_hold_seconds: int = Field(default=900, ge=1)
     simulated_execution_delay_ms: int = Field(default=500, ge=0)
-    max_quote_age_ms: int = Field(default=8000, ge=1)
+    max_quote_age_ms: int = Field(default=2000, ge=1)
     slippage_buffer_pct: float = Field(default=0.05, ge=0)
     safety_buffer_pct: float = Field(default=0.05, ge=0)
 
@@ -68,6 +68,8 @@ class Settings(BaseSettings):
     taker_fee_gate_pct: float = Field(default=0.05, ge=0)
     taker_fee_bitget_pct: float = Field(default=0.05, ge=0)
     taker_fee_htx_pct: float = Field(default=0.05, ge=0)
+
+    use_websocket: bool = True
 
     poll_interval_sec: float = Field(default=1.0, gt=0)
     request_timeout_sec: float = Field(default=8.0, gt=0)
