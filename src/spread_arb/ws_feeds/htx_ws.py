@@ -20,6 +20,7 @@ class HtxWsFeed(WebSocketFeed):
 
     ws_url = "wss://api.hbdm.com/linear-swap-ws"
     ping_interval_sec = 20.0
+    aiohttp_heartbeat_sec = None
 
     # HTX uses dash-separated, no 1000-prefix for BONK.
     _STRIP_1000_PREFIX: dict[str, str] = {
@@ -58,6 +59,7 @@ class HtxWsFeed(WebSocketFeed):
         for s in self.symbols:
             contract = self._to_htx_contract(s)
             topic = f"market.{contract}.bbo"
+            self.log.debug("htx subscribe topic: %s", topic)
             messages.append(json.dumps({"sub": topic, "id": f"bbo_{contract}"}))
         return messages
 
@@ -103,8 +105,22 @@ class HtxWsFeed(WebSocketFeed):
         if "ping" in data:
             return None
 
-        # Subscription confirmations.
-        if "subbed" in data:
+        # Subscription confirmations/errors.
+        status = data.get("status")
+        if status == "ok" and "subbed" in data:
+            self._record_subscription_ok(
+                f"topic={data.get('subbed')} id={data.get('id')!r}",
+                info_level=True,
+            )
+            return None
+        if status == "error":
+            self._record_subscription_error(
+                (
+                    f"topic={data.get('subbed') or data.get('topic') or data.get('ch')!r} "
+                    f"err_code={data.get('err-code')!r} err_msg={data.get('err-msg')!r}"
+                ),
+                payload=data,
+            )
             return None
 
         # BBO update: {"ch": "market.BTC-USDT.bbo", "ts": ..., "tick": {...}}

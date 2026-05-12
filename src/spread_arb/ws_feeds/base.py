@@ -23,8 +23,11 @@ class WebSocketFeed(ABC):
     # Subclasses must set these.
     ws_url: str = ""
     ping_interval_sec: float = 20.0
+    aiohttp_heartbeat_sec: float | None = 20.0
+    receive_timeout_sec: float | None = None
     reconnect_base_sec: float = 1.0
     reconnect_max_sec: float = 30.0
+    sample_message_limit: int = 3
 
     def __init__(
         self,
@@ -39,7 +42,10 @@ class WebSocketFeed(ABC):
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._msg_count: int = 0
         self._quote_count: int = 0
-        self._sample_logged: bool = False
+        self._sample_logged_count: int = 0
+        self._subscription_ok_count: int = 0
+        self._subscription_error_count: int = 0
+        self._server_ping_count: int = 0
 
     @property
     @abstractmethod
@@ -77,6 +83,26 @@ class WebSocketFeed(ABC):
         """
         return False
 
+    def _record_subscription_ok(self, detail: str | None = None, *, info_level: bool = False) -> None:
+        self._subscription_ok_count += 1
+        if detail:
+            if info_level:
+                self.log.info("subscription ok | %s", detail)
+            else:
+                self.log.debug("subscription ok | %s", detail)
+
+    def _record_subscription_error(self, detail: str, payload: object | None = None) -> None:
+        self._subscription_error_count += 1
+        if payload is None:
+            self.log.warning("subscription error | %s", detail)
+        else:
+            self.log.warning("subscription error | %s | payload=%s", detail, payload)
+
+    def _effective_receive_timeout_sec(self) -> float:
+        if self.receive_timeout_sec is not None:
+            return self.receive_timeout_sec
+        return max(self.ping_interval_sec * 3, 10.0)
+
     async def run(self, stop_event: asyncio.Event) -> None:
         """Main loop: connect -> subscribe -> read messages -> reconnect on error."""
         backoff = self.reconnect_base_sec
@@ -101,26 +127,32 @@ class WebSocketFeed(ABC):
 
         async with self.session.ws_connect(
             self.ws_url,
-            heartbeat=self.ping_interval_sec,
-            receive_timeout=self.ping_interval_sec * 3,
+            heartbeat=self.aiohttp_heartbeat_sec,
+            receive_timeout=self._effective_receive_timeout_sec(),
         ) as ws:
             self._ws = ws
             self._msg_count = 0
             self._quote_count = 0
-            self._sample_logged = False
+            self._sample_logged_count = 0
+            self._subscription_ok_count = 0
+            self._subscription_error_count = 0
+            self._server_ping_count = 0
             self.log.info("connected, subscribing to %d symbols", len(self.symbols))
 
             # Send subscription messages.
             for msg in self._build_subscribe_messages():
+                self.log.debug("subscribe payload: %s", msg)
                 await ws.send_str(msg)
                 # Small delay between subscribe batches to avoid rate limits.
                 await asyncio.sleep(0.1)
 
-            # Start ping task and stats task.
-            ping_task = asyncio.create_task(
-                self._ping_loop(ws, stop_event),
-                name=f"ws-ping-{self.name.value}",
-            )
+            # Start ping task only when feed uses custom app-level pings.
+            ping_task: asyncio.Task | None = None
+            if self._ping_payload() is not None:
+                ping_task = asyncio.create_task(
+                    self._ping_loop(ws, stop_event),
+                    name=f"ws-ping-{self.name.value}",
+                )
             stats_task = asyncio.create_task(
                 self._stats_loop(stop_event),
                 name=f"ws-stats-{self.name.value}",
@@ -129,12 +161,14 @@ class WebSocketFeed(ABC):
             try:
                 await self._read_loop(ws, stop_event)
             finally:
-                ping_task.cancel()
+                if ping_task is not None:
+                    ping_task.cancel()
                 stats_task.cancel()
-                try:
-                    await ping_task
-                except asyncio.CancelledError:
-                    pass
+                if ping_task is not None:
+                    try:
+                        await ping_task
+                    except asyncio.CancelledError:
+                        pass
                 try:
                     await stats_task
                 except asyncio.CancelledError:
@@ -166,6 +200,7 @@ class WebSocketFeed(ABC):
             # Let subclasses handle server-initiated pings (Gate, HTX).
             try:
                 if await self._handle_server_ping(ws, raw):
+                    self._server_ping_count += 1
                     continue
             except Exception as exc:  # noqa: BLE001
                 self.log.debug("server ping handler error: %s", exc)
@@ -175,11 +210,11 @@ class WebSocketFeed(ABC):
 
             self._msg_count += 1
 
-            # Log first non-ping/pong message as a sample for debugging.
-            if not self._sample_logged:
+            # Log first few non-ping/pong messages for startup diagnostics.
+            if self._sample_logged_count < self.sample_message_limit:
                 sample = str(raw)[:500] if isinstance(raw, str) else str(raw[:500])
-                self.log.info("first data message sample: %s", sample)
-                self._sample_logged = True
+                self._sample_logged_count += 1
+                self.log.info("data message sample #%d: %s", self._sample_logged_count, sample)
 
             try:
                 quote = self._parse_message(raw)
@@ -205,9 +240,12 @@ class WebSocketFeed(ABC):
             except TimeoutError:
                 pass
             self.log.info(
-                "ws stats | msgs=%d quotes=%d (%.1f%% parsed)",
+                "ws stats | msgs=%d quotes=%d subs_ok=%d subs_err=%d server_pings=%d (%.1f%% parsed)",
                 self._msg_count,
                 self._quote_count,
+                self._subscription_ok_count,
+                self._subscription_error_count,
+                self._server_ping_count,
                 (self._quote_count / self._msg_count * 100) if self._msg_count else 0,
             )
 

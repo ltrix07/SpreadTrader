@@ -16,6 +16,8 @@ class GateWsFeed(WebSocketFeed):
 
     ws_url = "wss://fx-ws.gateio.ws/v4/ws/usdt"
     ping_interval_sec = 15.0
+    aiohttp_heartbeat_sec = None
+    subscribe_batch_size = 10
 
     # Gate uses underscore-separated, no 1000-prefix for BONK.
     _STRIP_1000_PREFIX: dict[str, str] = {
@@ -52,7 +54,7 @@ class GateWsFeed(WebSocketFeed):
         contracts = [self._to_gate_contract(s) for s in self.symbols]
         # Gate allows subscribing to multiple contracts per message.
         messages = []
-        batch_size = 50
+        batch_size = self.subscribe_batch_size
         for i in range(0, len(contracts), batch_size):
             batch = contracts[i : i + batch_size]
             messages.append(json.dumps({
@@ -95,9 +97,28 @@ class GateWsFeed(WebSocketFeed):
 
         data = json.loads(raw)
 
-        # Only process book_ticker update events.
+        # Subscription confirmation/error diagnostics.
         channel = data.get("channel", "")
         event = data.get("event", "")
+        if channel == "futures.book_ticker" and event == "subscribe":
+            error = data.get("error")
+            status = data.get("status")
+            result = data.get("result")
+            if error is not None or status == "error":
+                self._record_subscription_error(
+                    (
+                        f"channel={channel} event={event} "
+                        f"status={status!r} error={error!r} result={result!r}"
+                    ),
+                    payload=data,
+                )
+            else:
+                self._record_subscription_ok(
+                    f"channel={channel} event={event} status={status!r} result={result!r}",
+                )
+            return None
+
+        # Only process book_ticker update events.
         if channel != "futures.book_ticker" or event != "update":
             return None
 
