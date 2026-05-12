@@ -72,7 +72,7 @@ class GateWsFeed(WebSocketFeed):
     async def _handle_server_ping(
         self, ws: aiohttp.ClientWebSocketResponse, raw: str | bytes
     ) -> bool:
-        """Gate.io sends {"channel": "futures.ping"} — must respond with pong."""
+        """Gate.io sends {"channel": "futures.ping"} -- must respond with pong."""
         if isinstance(raw, bytes):
             return False
         if "futures.ping" not in raw:

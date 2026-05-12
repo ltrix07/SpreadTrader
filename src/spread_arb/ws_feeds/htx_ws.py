@@ -81,7 +81,7 @@ class HtxWsFeed(WebSocketFeed):
     async def _handle_server_ping(
         self, ws: aiohttp.ClientWebSocketResponse, raw: str | bytes
     ) -> bool:
-        """HTX sends gzip-compressed {"ping": ts} — must respond with {"pong": ts}."""
+        """HTX sends gzip-compressed {"ping": ts} -- must respond with {"pong": ts}."""
         text = self._decompress(raw)
         if '"ping"' not in text:
             return False
