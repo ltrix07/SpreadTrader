@@ -5,6 +5,8 @@ import json
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import aiohttp
+
 from ..models import ExchangeName, Quote, Symbol
 from .base import WebSocketFeed
 
@@ -60,12 +62,11 @@ class HtxWsFeed(WebSocketFeed):
         return messages
 
     def _ping_payload(self) -> str | bytes | None:
-        # HTX server sends pings; we respond in _parse_message.
-        # No need for our own ping loop — return None.
+        # HTX server sends pings; we respond in _handle_server_ping.
+        # No need for our own ping loop.
         return None
 
     def _is_pong(self, raw: str | bytes) -> bool:
-        # We handle server pings inside _parse_message, so nothing here.
         return False
 
     def _decompress(self, raw: str | bytes) -> str:
@@ -77,17 +78,29 @@ class HtxWsFeed(WebSocketFeed):
                 return raw.decode("utf-8", errors="replace")
         return raw
 
+    async def _handle_server_ping(
+        self, ws: aiohttp.ClientWebSocketResponse, raw: str | bytes
+    ) -> bool:
+        """HTX sends gzip-compressed {"ping": ts} — must respond with {"pong": ts}."""
+        text = self._decompress(raw)
+        if '"ping"' not in text:
+            return False
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        if "ping" not in data:
+            return False
+        pong = json.dumps({"pong": data["ping"]})
+        await ws.send_str(pong)
+        return True
+
     def _parse_message(self, raw: str | bytes) -> Quote | None:
         text = self._decompress(raw)
         data = json.loads(text)
 
-        # HTX server ping — must respond with pong immediately.
+        # Server pings are already handled by _handle_server_ping.
         if "ping" in data:
-            import asyncio
-            ts = data["ping"]
-            pong = json.dumps({"pong": ts})
-            if self._ws is not None and not self._ws.closed:
-                asyncio.ensure_future(self._ws.send_str(pong))
             return None
 
         # Subscription confirmations.

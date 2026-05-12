@@ -5,6 +5,8 @@ import time
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import aiohttp
+
 from ..models import ExchangeName, Quote, Symbol
 from .base import WebSocketFeed
 
@@ -66,6 +68,21 @@ class GateWsFeed(WebSocketFeed):
             "time": int(time.time()),
             "channel": "futures.ping",
         })
+
+    async def _handle_server_ping(
+        self, ws: aiohttp.ClientWebSocketResponse, raw: str | bytes
+    ) -> bool:
+        """Gate.io sends {"channel": "futures.ping"} — must respond with pong."""
+        if isinstance(raw, bytes):
+            return False
+        if "futures.ping" not in raw:
+            return False
+        pong = json.dumps({
+            "time": int(time.time()),
+            "channel": "futures.pong",
+        })
+        await ws.send_str(pong)
+        return True
 
     def _is_pong(self, raw: str | bytes) -> bool:
         if isinstance(raw, str) and "futures.pong" in raw:

@@ -63,6 +63,17 @@ class WebSocketFeed(ABC):
             return True
         return False
 
+    async def _handle_server_ping(
+        self, ws: aiohttp.ClientWebSocketResponse, raw: str | bytes
+    ) -> bool:
+        """Handle server-initiated pings that need an application-level pong.
+
+        Return True if the message was a server ping (and has been answered),
+        so that the read loop can skip further processing.
+        Subclasses override this for exchanges like Gate.io and HTX.
+        """
+        return False
+
     async def run(self, stop_event: asyncio.Event) -> None:
         """Main loop: connect → subscribe → read messages → reconnect on error."""
         backoff = self.reconnect_base_sec
@@ -136,6 +147,13 @@ class WebSocketFeed(ABC):
                 break
             else:
                 continue
+
+            # Let subclasses handle server-initiated pings (Gate, HTX).
+            try:
+                if await self._handle_server_ping(ws, raw):
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                self.log.debug("server ping handler error: %s", exc)
 
             if self._is_pong(raw):
                 continue
