@@ -36,6 +36,23 @@ class OpportunityRecord:
 
 
 @dataclass(slots=True)
+class SpreadSnapshotRecord:
+    timestamp: str
+    symbol: str
+    exchange_a: str
+    exchange_b: str
+    bid_a: float
+    ask_a: float
+    bid_b: float
+    ask_b: float
+    raw_spread_ab_pct: float   # long A (buy ask_a), short B (sell bid_b)
+    raw_spread_ba_pct: float   # long B (buy ask_b), short A (sell bid_a)
+    best_raw_spread_pct: float  # max of the two directions
+    quote_age_a_ms: float
+    quote_age_b_ms: float
+
+
+@dataclass(slots=True)
 class PaperTradeRecord:
     symbol: str
     long_exchange: str
@@ -137,6 +154,38 @@ def init_sqlite(database_url: str) -> Path:
             """
         )
         _ensure_paper_trades_columns(conn)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS spread_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                exchange_a TEXT NOT NULL,
+                exchange_b TEXT NOT NULL,
+                bid_a REAL NOT NULL,
+                ask_a REAL NOT NULL,
+                bid_b REAL NOT NULL,
+                ask_b REAL NOT NULL,
+                raw_spread_ab_pct REAL NOT NULL,
+                raw_spread_ba_pct REAL NOT NULL,
+                best_raw_spread_pct REAL NOT NULL,
+                quote_age_a_ms REAL NOT NULL,
+                quote_age_b_ms REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_pair
+            ON spread_snapshots (symbol, exchange_a, exchange_b)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp
+            ON spread_snapshots (timestamp)
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS runtime_events (
@@ -351,6 +400,32 @@ class OpportunityStore:
         )
         self.conn.commit()
         return int(cursor.lastrowid)
+
+    def insert_spread_snapshots(self, records: list[SpreadSnapshotRecord]) -> int:
+        """Batch-insert spread snapshots. Returns number of rows inserted."""
+        if not records:
+            return 0
+        self.conn.executemany(
+            """
+            INSERT INTO spread_snapshots (
+                timestamp, symbol, exchange_a, exchange_b,
+                bid_a, ask_a, bid_b, ask_b,
+                raw_spread_ab_pct, raw_spread_ba_pct, best_raw_spread_pct,
+                quote_age_a_ms, quote_age_b_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    r.timestamp, r.symbol, r.exchange_a, r.exchange_b,
+                    r.bid_a, r.ask_a, r.bid_b, r.ask_b,
+                    r.raw_spread_ab_pct, r.raw_spread_ba_pct, r.best_raw_spread_pct,
+                    r.quote_age_a_ms, r.quote_age_b_ms,
+                )
+                for r in records
+            ],
+        )
+        self.conn.commit()
+        return len(records)
 
     @staticmethod
     def now_iso() -> str:

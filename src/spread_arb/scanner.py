@@ -25,7 +25,7 @@ from .exchanges import (
 from .models import ExchangeName, Quote
 from .opportunity import SpreadOpportunity, classify_opportunity
 from .paper_engine import PaperEngine
-from .storage import OpportunityRecord, OpportunityStore
+from .storage import OpportunityRecord, OpportunityStore, SpreadSnapshotRecord
 from .ws_feeds import (
     BinanceWsFeed,
     BitgetWsFeed,
@@ -96,10 +96,14 @@ class QuoteScanner:
                     self.paper_engine.summary_loop(self.stop_event),
                     name="paper-summary",
                 )
+                snapshot_task = asyncio.create_task(
+                    self._collect_spread_snapshots(),
+                    name="spread-snapshots",
+                )
 
                 await self.stop_event.wait()
 
-                bg_tasks = [*data_tasks, stale_task, spread_task, quote_health_task, paper_summary_task]
+                bg_tasks = [*data_tasks, stale_task, spread_task, quote_health_task, paper_summary_task, snapshot_task]
                 for task in bg_tasks:
                     task.cancel()
 
@@ -382,6 +386,100 @@ class QuoteScanner:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=interval_sec)
             except TimeoutError:
                 continue
+
+    async def _collect_spread_snapshots(self) -> None:
+        """Periodically snapshot spreads for all symbol x exchange-pair combos.
+
+        Runs every 10 seconds, records current spread state for mean-reversion
+        analysis.  Only records pairs where both quotes are reasonably fresh
+        (< 30 s) to avoid polluting the dataset with stale data.
+        """
+        interval_sec = 10.0
+        max_snapshot_age_ms = 30_000.0  # generous: we want the full picture
+        snapshot_count = 0
+
+        while not self.stop_event.is_set():
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=interval_sec)
+                return
+            except TimeoutError:
+                pass
+
+            if self.opportunity_store is None:
+                continue
+
+            now = datetime.now(UTC)
+            ts_iso = now.isoformat()
+            records: list[SpreadSnapshotRecord] = []
+
+            # Group quotes by symbol.
+            quotes_by_symbol: dict[str, dict[ExchangeName, Quote]] = {}
+            for (exchange, symbol), quote in self.latest_quotes.items():
+                quotes_by_symbol.setdefault(symbol, {})[exchange] = quote
+
+            for symbol, exchange_quotes in quotes_by_symbol.items():
+                if len(exchange_quotes) < 2:
+                    continue
+
+                exchanges = list(exchange_quotes.keys())
+                for i in range(len(exchanges)):
+                    for j in range(i + 1, len(exchanges)):
+                        ex_a = exchanges[i]
+                        ex_b = exchanges[j]
+                        q_a = exchange_quotes[ex_a]
+                        q_b = exchange_quotes[ex_b]
+
+                        age_a_ms = (now - q_a.received_at).total_seconds() * 1000.0
+                        age_b_ms = (now - q_b.received_at).total_seconds() * 1000.0
+
+                        if age_a_ms > max_snapshot_age_ms or age_b_ms > max_snapshot_age_ms:
+                            continue
+
+                        ask_a = float(q_a.best_ask_price)
+                        bid_a = float(q_a.best_bid_price)
+                        ask_b = float(q_b.best_ask_price)
+                        bid_b = float(q_b.best_bid_price)
+
+                        # Direction A->B: long A (buy ask_a), short B (sell bid_b).
+                        spread_ab = (bid_b - ask_a) / ask_a * 100.0 if ask_a > 0 else 0.0
+                        # Direction B->A: long B (buy ask_b), short A (sell bid_a).
+                        spread_ba = (bid_a - ask_b) / ask_b * 100.0 if ask_b > 0 else 0.0
+
+                        # Ensure consistent ordering: exchange_a < exchange_b alphabetically.
+                        if ex_a.value > ex_b.value:
+                            ex_a, ex_b = ex_b, ex_a
+                            spread_ab, spread_ba = spread_ba, spread_ab
+                            bid_a, bid_b = bid_b, bid_a
+                            ask_a, ask_b = ask_b, ask_a
+                            age_a_ms, age_b_ms = age_b_ms, age_a_ms
+
+                        records.append(SpreadSnapshotRecord(
+                            timestamp=ts_iso,
+                            symbol=symbol,
+                            exchange_a=ex_a.value,
+                            exchange_b=ex_b.value,
+                            bid_a=bid_a,
+                            ask_a=ask_a,
+                            bid_b=bid_b,
+                            ask_b=ask_b,
+                            raw_spread_ab_pct=spread_ab,
+                            raw_spread_ba_pct=spread_ba,
+                            best_raw_spread_pct=max(spread_ab, spread_ba),
+                            quote_age_a_ms=age_a_ms,
+                            quote_age_b_ms=age_b_ms,
+                        ))
+
+            if records:
+                try:
+                    inserted = self.opportunity_store.insert_spread_snapshots(records)
+                    snapshot_count += inserted
+                    if snapshot_count % 500 < len(records):  # log roughly every 500 rows
+                        self.log.info(
+                            "spread snapshots | batch=%d total=%d",
+                            inserted, snapshot_count,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    self.log.warning("spread snapshot write error: %s", exc)
 
     def _start_ws_feeds(self, session: aiohttp.ClientSession) -> list[asyncio.Task]:
         """Create WebSocket feed tasks for all configured exchanges."""
