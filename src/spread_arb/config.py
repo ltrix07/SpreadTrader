@@ -75,6 +75,7 @@ class Settings(BaseSettings):
     request_timeout_sec: float = Field(default=8.0, gt=0)
     reconnect_backoff_sec: float = Field(default=2.0, gt=0)
     top_spreads_log_interval_sec: float = Field(default=5.0, gt=0)
+    spread_scan_interval_sec: float = Field(default=0.5, gt=0)
 
     @staticmethod
     def _parse_list_env(value: Any) -> list[str] | Any:

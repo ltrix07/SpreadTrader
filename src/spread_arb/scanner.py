@@ -44,8 +44,10 @@ class QuoteScanner:
         self.stop_event = asyncio.Event()
         self.last_quote_at: dict[tuple[ExchangeName, str], datetime] = {}
         self.latest_quotes: dict[tuple[ExchangeName, str], Quote] = {}
+        self.latest_quotes_by_symbol: dict[str, dict[ExchangeName, Quote]] = {}
         self.latest_best_opportunity_by_symbol: dict[str, SpreadOpportunity] = {}
         self.latest_raw_spread_by_symbol: dict[str, SpreadOpportunity] = {}
+        self._dirty_symbols: set[str] = set()
         self.rejection_counts: Counter[str] = Counter()
         self.total_scans: int = 0
         self.opportunity_store: OpportunityStore | None = None
@@ -96,6 +98,10 @@ class QuoteScanner:
                     self.paper_engine.summary_loop(self.stop_event),
                     name="paper-summary",
                 )
+                symbol_scan_task = asyncio.create_task(
+                    self._scan_dirty_symbols_loop(),
+                    name="symbol-scan",
+                )
                 snapshot_task = asyncio.create_task(
                     self._collect_spread_snapshots(),
                     name="spread-snapshots",
@@ -103,7 +109,15 @@ class QuoteScanner:
 
                 await self.stop_event.wait()
 
-                bg_tasks = [*data_tasks, stale_task, spread_task, quote_health_task, paper_summary_task, snapshot_task]
+                bg_tasks = [
+                    *data_tasks,
+                    stale_task,
+                    spread_task,
+                    quote_health_task,
+                    paper_summary_task,
+                    symbol_scan_task,
+                    snapshot_task,
+                ]
                 for task in bg_tasks:
                     task.cancel()
 
@@ -116,31 +130,45 @@ class QuoteScanner:
     def stop(self) -> None:
         self.stop_event.set()
 
-    async def _on_quote(self, quote: Quote) -> None:
+    def _on_quote(self, quote: Quote) -> None:
         key = (quote.exchange, quote.symbol)
         self.last_quote_at[key] = quote.received_at
         self.latest_quotes[key] = quote
-        self._scan_symbol(quote.symbol)
+        self.latest_quotes_by_symbol.setdefault(quote.symbol, {})[quote.exchange] = quote
+        self._dirty_symbols.add(quote.symbol)
         if self.paper_engine is not None:
             self.paper_engine.on_quote_tick()
-        # Yield control to the event loop so periodic tasks
-        # (snapshot collector, stats, health) can run.
-        await asyncio.sleep(0)
+
+    async def _scan_dirty_symbols_loop(self) -> None:
+        interval_sec = max(self.settings.spread_scan_interval_sec, 0.05)
+
+        while not self.stop_event.is_set():
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=interval_sec)
+                return
+            except TimeoutError:
+                pass
+
+            dirty_symbols = tuple(self._dirty_symbols)
+            self._dirty_symbols.clear()
+            if not dirty_symbols:
+                continue
+
+            for index, symbol in enumerate(dirty_symbols, start=1):
+                self._scan_symbol(symbol)
+                # Keep this worker cooperative under large symbol universes.
+                if index % 5 == 0:
+                    await asyncio.sleep(0)
 
     def _scan_symbol(self, symbol: str) -> None:
-        symbol_quotes = {
-            exchange: quote
-            for (exchange, quote_symbol), quote in self.latest_quotes.items()
-            if quote_symbol == symbol
-        }
-
-        if len(symbol_quotes) < 2:
+        symbol_quotes = self.latest_quotes_by_symbol.get(symbol)
+        if symbol_quotes is None or len(symbol_quotes) < 2:
             return
 
         self.total_scans += 1
         all_spreads: list[SpreadOpportunity] = []
 
-        for first_exchange, second_exchange in combinations(symbol_quotes.keys(), 2):
+        for first_exchange, second_exchange in combinations(tuple(symbol_quotes.keys()), 2):
             first_quote = symbol_quotes[first_exchange]
             second_quote = symbol_quotes[second_exchange]
 

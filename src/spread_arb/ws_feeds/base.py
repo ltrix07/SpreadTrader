@@ -28,6 +28,7 @@ class WebSocketFeed(ABC):
     reconnect_base_sec: float = 1.0
     reconnect_max_sec: float = 30.0
     sample_message_limit: int = 3
+    yield_every_messages: int = 50
 
     def __init__(
         self,
@@ -46,6 +47,7 @@ class WebSocketFeed(ABC):
         self._subscription_ok_count: int = 0
         self._subscription_error_count: int = 0
         self._server_ping_count: int = 0
+        self._msg_count_since_yield: int = 0
 
     @property
     @abstractmethod
@@ -137,6 +139,7 @@ class WebSocketFeed(ABC):
             self._subscription_ok_count = 0
             self._subscription_error_count = 0
             self._server_ping_count = 0
+            self._msg_count_since_yield = 0
             self.log.info("connected, subscribing to %d symbols", len(self.symbols))
 
             # Send subscription messages.
@@ -230,6 +233,11 @@ class WebSocketFeed(ABC):
                         await callback_result
                 except Exception as exc:  # noqa: BLE001
                     self.log.warning("on_quote callback error: %s", exc)
+
+            self._msg_count_since_yield += 1
+            if self._msg_count_since_yield >= max(self.yield_every_messages, 1):
+                self._msg_count_since_yield = 0
+                await asyncio.sleep(0)
 
     async def _stats_loop(self, stop_event: asyncio.Event) -> None:
         """Periodically log message/quote counters for debugging."""
