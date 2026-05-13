@@ -123,6 +123,9 @@ class QuoteScanner:
         self._scan_symbol(quote.symbol)
         if self.paper_engine is not None:
             self.paper_engine.on_quote_tick()
+        # Yield control to the event loop so periodic tasks
+        # (snapshot collector, stats, health) can run.
+        await asyncio.sleep(0)
 
     def _scan_symbol(self, symbol: str) -> None:
         symbol_quotes = {
