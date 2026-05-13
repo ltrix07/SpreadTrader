@@ -60,6 +60,7 @@ def compute_stats(
     snapshots: list[dict],
     sigma_threshold: float = 2.0,
     roundtrip_cost_pct: float = 0.30,
+    min_samples: int = 3,
 ) -> list[PairStats]:
     """Compute statistics per (symbol, exchange_a, exchange_b) triple."""
     # Group by triple.
@@ -71,7 +72,7 @@ def compute_stats(
     results: list[PairStats] = []
     for (symbol, ex_a, ex_b), spreads in groups.items():
         n = len(spreads)
-        if n < 10:
+        if n < min_samples:
             continue
 
         sorted_spreads = sorted(spreads)
@@ -161,11 +162,12 @@ def print_report(
     print("-" * 100)
     ranked = sorted(stats, key=lambda s: s.count_above_2sigma, reverse=True)[:top_n]
 
+    hdr_sig = f">{sigma}s"
     print(
         f"{'Symbol':<14s} {'Pair':<16s} "
         f"{'Mean%':>7s} {'Std%':>7s} {'P95%':>7s} {'Max%':>7s} "
-        f"{'>{sigma}σ#':>6s} {'>{sigma}σ%':>6s} "
-        f"{'AvgDur':>7s} {'NetAt{sigma}σ%':>9s} {'N':>6s}"
+        f"{hdr_sig + '#':>6s} {hdr_sig + '%':>6s} "
+        f"{'AvgDur':>7s} {'Net%':>9s} {'N':>6s}"
     )
     for s in ranked:
         pair = f"{s.exchange_a}->{s.exchange_b}"
@@ -246,6 +248,10 @@ def main() -> None:
         "--fees", type=float, default=0.30,
         help="Estimated roundtrip cost %% (default: 0.30 = 2×taker both sides + buffer)",
     )
+    parser.add_argument(
+        "--min-samples", type=int, default=3,
+        help="Minimum samples per pair to include in analysis (default: 3)",
+    )
     args = parser.parse_args()
 
     db_path = args.db
@@ -262,7 +268,12 @@ def main() -> None:
     print(f"Loaded {len(snapshots):,} snapshots")
     print()
 
-    stats = compute_stats(snapshots, sigma_threshold=args.sigma, roundtrip_cost_pct=args.fees)
+    stats = compute_stats(
+        snapshots,
+        sigma_threshold=args.sigma,
+        roundtrip_cost_pct=args.fees,
+        min_samples=args.min_samples,
+    )
     print_report(stats, top_n=args.top, sigma=args.sigma)
 
 
