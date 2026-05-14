@@ -23,8 +23,8 @@ from .exchanges import (
     OkxExchange,
 )
 from .models import ExchangeName, Quote
+from .mean_reversion_engine import MeanReversionEngine
 from .opportunity import SpreadOpportunity, classify_opportunity
-from .paper_engine import PaperEngine
 from .storage import OpportunityRecord, OpportunityStore, SpreadSnapshotRecord
 from .ws_feeds import (
     BinanceWsFeed,
@@ -51,7 +51,7 @@ class QuoteScanner:
         self.rejection_counts: Counter[str] = Counter()
         self.total_scans: int = 0
         self.opportunity_store: OpportunityStore | None = None
-        self.paper_engine: PaperEngine | None = None
+        self.mean_reversion_engine: MeanReversionEngine | None = None
 
         self.exchange_fees_pct: dict[ExchangeName, float] = {
             ExchangeName.MEXC: self.settings.taker_fee_mexc_pct,
@@ -68,11 +68,13 @@ class QuoteScanner:
 
         timeout = aiohttp.ClientTimeout(total=self.settings.request_timeout_sec)
         with OpportunityStore(self.settings.database_url) as self.opportunity_store:
-            self.paper_engine = PaperEngine(
-                settings=self.settings,
-                opportunity_store=self.opportunity_store,
-                get_latest_quote=self._get_latest_quote,
-            )
+            self.mean_reversion_engine = None
+            if self.settings.mr_enabled:
+                self.mean_reversion_engine = MeanReversionEngine(
+                    settings=self.settings,
+                    opportunity_store=self.opportunity_store,
+                    get_latest_quote=self._get_latest_quote,
+                )
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 if self.settings.use_websocket:
                     data_tasks = self._start_ws_feeds(session)
@@ -94,10 +96,12 @@ class QuoteScanner:
                 stale_task = asyncio.create_task(self._monitor_stale_quotes(), name="stale-monitor")
                 spread_task = asyncio.create_task(self._log_top_spreads(), name="spread-monitor")
                 quote_health_task = asyncio.create_task(self._log_quote_health(), name="quote-health")
-                paper_summary_task = asyncio.create_task(
-                    self.paper_engine.summary_loop(self.stop_event),
-                    name="paper-summary",
-                )
+                mr_summary_task: asyncio.Task | None = None
+                if self.mean_reversion_engine is not None:
+                    mr_summary_task = asyncio.create_task(
+                        self.mean_reversion_engine.summary_loop(self.stop_event),
+                        name="mr-summary",
+                    )
                 symbol_scan_task = asyncio.create_task(
                     self._scan_dirty_symbols_loop(),
                     name="symbol-scan",
@@ -114,18 +118,20 @@ class QuoteScanner:
                     stale_task,
                     spread_task,
                     quote_health_task,
-                    paper_summary_task,
                     symbol_scan_task,
                     snapshot_task,
                 ]
+                if mr_summary_task is not None:
+                    bg_tasks.append(mr_summary_task)
                 for task in bg_tasks:
                     task.cancel()
 
                 await asyncio.gather(*bg_tasks, return_exceptions=True)
-                await self.paper_engine.shutdown()
+                if self.mean_reversion_engine is not None:
+                    await self.mean_reversion_engine.shutdown()
                 self.log.info("scanner stopped")
         self.opportunity_store = None
-        self.paper_engine = None
+        self.mean_reversion_engine = None
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -136,8 +142,8 @@ class QuoteScanner:
         self.latest_quotes[key] = quote
         self.latest_quotes_by_symbol.setdefault(quote.symbol, {})[quote.exchange] = quote
         self._dirty_symbols.add(quote.symbol)
-        if self.paper_engine is not None:
-            self.paper_engine.on_quote_tick()
+        if self.mean_reversion_engine is not None:
+            self.mean_reversion_engine.check_exits(self.latest_quotes)
 
     async def _scan_dirty_symbols_loop(self) -> None:
         interval_sec = max(self.settings.spread_scan_interval_sec, 0.05)
@@ -194,7 +200,7 @@ class QuoteScanner:
             best_raw = max(all_spreads, key=lambda item: item.raw_spread_pct)
             self.latest_raw_spread_by_symbol[symbol] = best_raw
 
-        # Paper engine: only track observed opportunities.
+        # Track observed opportunities for diagnostics/logging.
         observed = [s for s in all_spreads if s.status == "observed"]
         if observed:
             self.latest_best_opportunity_by_symbol[symbol] = max(
@@ -301,8 +307,6 @@ class QuoteScanner:
                 opportunity.estimated_net_spread_pct,
                 opportunity.estimated_roundtrip_cost_pct,
             )
-            if self.paper_engine is not None:
-                self.paper_engine.on_observed_opportunity(opportunity)
         else:
             self.log.debug(
                 "rejected | %s | long=%s short=%s | raw=%.4f%% | net=%.4f%% | reason=%s",
@@ -450,6 +454,8 @@ class QuoteScanner:
 
                 # Snapshot current quotes to avoid dict-changed-during-iteration.
                 snapshot_quotes = dict(self.latest_quotes)
+                if self.mean_reversion_engine is not None:
+                    self.mean_reversion_engine.update_baselines(snapshot_quotes)
 
                 # Group quotes by symbol.
                 quotes_by_symbol: dict[str, dict[ExchangeName, Quote]] = {}

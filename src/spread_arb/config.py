@@ -69,6 +69,17 @@ class Settings(BaseSettings):
     taker_fee_bitget_pct: float = Field(default=0.05, ge=0)
     taker_fee_htx_pct: float = Field(default=0.05, ge=0)
 
+    # Mean reversion settings
+    mr_enabled: bool = True
+    mr_sigma_entry: float = Field(default=2.0, gt=0)
+    mr_sigma_stop: float = Field(default=4.0, gt=0)
+    mr_rolling_window: int = Field(default=360, ge=30)
+    mr_min_net_edge_pct: float = Field(default=0.10, ge=0)
+    mr_max_positions: int = Field(default=1, ge=1)
+    mr_notional_usdt: float = Field(default=350.0, gt=0)
+    mr_max_hold_seconds: int = Field(default=900, ge=1)
+    mr_cooldown_sec: int = Field(default=30, ge=0)
+
     use_websocket: bool = True
 
     poll_interval_sec: float = Field(default=1.0, gt=0)
