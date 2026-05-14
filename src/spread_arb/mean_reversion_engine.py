@@ -72,6 +72,7 @@ class MeanRevPosition:
     entry_rolling_mean: float
     entry_rolling_std: float
     sigma_at_entry: float
+    take_profit_target: float
     max_adverse_spread_pct: float
     max_favorable_spread_pct: float
     estimated_entry_fees_usdt: float
@@ -113,6 +114,7 @@ class MeanReversionEngine:
 
         self.baselines: dict[tuple[str, ExchangeName, ExchangeName], RollingBaseline] = {}
         self.baseline_ready_keys: set[tuple[str, ExchangeName, ExchangeName]] = set()
+        self._preloading = False
 
         self.pending_entries_by_symbol: dict[str, PendingMrEntry] = {}
         self.open_positions_by_symbol: dict[str, MeanRevPosition] = {}
@@ -135,6 +137,86 @@ class MeanReversionEngine:
             ExchangeName.BITGET: self.settings.taker_fee_bitget_pct,
             ExchangeName.HTX: self.settings.taker_fee_htx_pct,
         }
+
+    def preload_baselines(self, database_url: str) -> None:
+        """Load recent spread snapshots from DB to pre-populate rolling baselines."""
+        import sqlite3
+
+        from .storage import _sqlite_path_from_url
+
+        db_path = _sqlite_path_from_url(database_url)
+        if not db_path.exists():
+            self.log.warning("preload: database not found at %s", db_path)
+            return
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        self._preloading = True
+        try:
+            has_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='spread_snapshots' LIMIT 1"
+            ).fetchone()
+            if has_table is None:
+                self.log.info("preload: spread_snapshots table not found, starting cold")
+                return
+
+            window = self.settings.mr_rolling_window
+            max_rows = window * 700
+            rows = conn.execute(
+                """
+                SELECT
+                    symbol,
+                    exchange_a,
+                    exchange_b,
+                    raw_spread_ab_pct,
+                    raw_spread_ba_pct
+                FROM spread_snapshots
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (max_rows,),
+            ).fetchall()
+
+            if not rows:
+                self.log.info("preload: no snapshots found, starting cold")
+                return
+
+            loaded_count = 0
+            for row in reversed(rows):
+                symbol = str(row["symbol"])
+                ex_a_raw = str(row["exchange_a"])
+                ex_b_raw = str(row["exchange_b"])
+                try:
+                    ex_a = ExchangeName(ex_a_raw)
+                    ex_b = ExchangeName(ex_b_raw)
+                except ValueError:
+                    continue
+
+                self._update_baseline(
+                    symbol=symbol,
+                    long_exchange=ex_a,
+                    short_exchange=ex_b,
+                    spread_pct=float(row["raw_spread_ab_pct"]),
+                )
+                self._update_baseline(
+                    symbol=symbol,
+                    long_exchange=ex_b,
+                    short_exchange=ex_a,
+                    spread_pct=float(row["raw_spread_ba_pct"]),
+                )
+                loaded_count += 1
+        finally:
+            self._preloading = False
+            conn.close()
+
+        ready_count = len(self.baseline_ready_keys)
+        total_baselines = len(self.baselines)
+        self.log.info(
+            "preload complete | loaded %d snapshots | %d baselines total | %d ready",
+            loaded_count,
+            total_baselines,
+            ready_count,
+        )
 
     async def shutdown(self) -> None:
         tasks = [pending.task for pending in self.pending_entries_by_symbol.values()]
@@ -261,7 +343,7 @@ class MeanReversionEngine:
             stop_threshold = position.entry_rolling_mean + (self.settings.mr_sigma_stop * position.entry_rolling_std)
 
             close_reason: str | None = None
-            if current_spread_pct <= position.entry_rolling_mean:
+            if current_spread_pct <= position.take_profit_target:
                 close_reason = "mean_reversion"
             elif current_spread_pct > stop_threshold:
                 close_reason = "stop_loss"
@@ -296,15 +378,16 @@ class MeanReversionEngine:
         baseline.update(spread_pct)
         if not was_ready and baseline.is_ready and key not in self.baseline_ready_keys:
             self.baseline_ready_keys.add(key)
-            self.log.info(
-                "mr baseline ready | %s %s->%s | window=%d | mean=%+.4f%% | std=%.4f%%",
-                symbol,
-                long_exchange.value,
-                short_exchange.value,
-                baseline.window_size,
-                baseline.mean,
-                baseline.std,
-            )
+            if not self._preloading:
+                self.log.info(
+                    "mr baseline ready | %s %s->%s | window=%d | mean=%+.4f%% | std=%.4f%%",
+                    symbol,
+                    long_exchange.value,
+                    short_exchange.value,
+                    baseline.window_size,
+                    baseline.mean,
+                    baseline.std,
+                )
 
     def _evaluate_signal(
         self,
@@ -467,6 +550,8 @@ class MeanReversionEngine:
                 std=current.rolling_std,
                 spread_pct=current_spread_pct,
             )
+            edge_at_entry = current_spread_pct - current.rolling_mean
+            take_profit_target = current_spread_pct - (edge_at_entry * self.settings.mr_take_profit_fraction)
             position = MeanRevPosition(
                 symbol=symbol,
                 long_exchange=current.long_exchange,
@@ -480,6 +565,7 @@ class MeanReversionEngine:
                 entry_rolling_mean=current.rolling_mean,
                 entry_rolling_std=current.rolling_std,
                 sigma_at_entry=sigma_at_entry,
+                take_profit_target=take_profit_target,
                 max_adverse_spread_pct=current_spread_pct,
                 max_favorable_spread_pct=current_spread_pct,
                 estimated_entry_fees_usdt=entry_fees_usdt,
@@ -488,7 +574,7 @@ class MeanReversionEngine:
             self.open_positions_by_symbol[symbol] = position
 
             self.log.info(
-                "mr open | %s | long=%s @ %.6f | short=%s @ %.6f | spread=%+.4f%% | mean=%+.4f%% | sigma=%.2f",
+                "mr open | %s | long=%s @ %.6f | short=%s @ %.6f | spread=%+.4f%% | mean=%+.4f%% | sigma=%.2f | target=%+.4f%%",
                 symbol,
                 position.long_exchange.value,
                 position.entry_long_price,
@@ -497,6 +583,7 @@ class MeanReversionEngine:
                 position.entry_spread_pct,
                 position.entry_rolling_mean,
                 position.sigma_at_entry,
+                position.take_profit_target,
             )
         except asyncio.CancelledError:
             raise

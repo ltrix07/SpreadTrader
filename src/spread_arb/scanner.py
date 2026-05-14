@@ -75,6 +75,7 @@ class QuoteScanner:
                     opportunity_store=self.opportunity_store,
                     get_latest_quote=self._get_latest_quote,
                 )
+                self.mean_reversion_engine.preload_baselines(self.settings.database_url)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 if self.settings.use_websocket:
                     data_tasks = self._start_ws_feeds(session)
