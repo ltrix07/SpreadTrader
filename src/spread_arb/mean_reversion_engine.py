@@ -238,7 +238,8 @@ class MeanReversionEngine:
             return
 
         now = datetime.now(UTC)
-        max_age_ms = self.settings.max_quote_age_ms
+        exit_max_age_ms = self.settings.mr_exit_max_quote_age_ms
+        tracking_fresh_max_age_ms = min(exit_max_age_ms, 5_000)
 
         for symbol, position in list(self.open_positions_by_symbol.items()):
             long_quote = latest_quotes.get((position.long_exchange, symbol))
@@ -252,8 +253,9 @@ class MeanReversionEngine:
             age_short_ms = (now - short_quote.received_at).total_seconds() * 1000.0
 
             current_spread_pct = _directional_spread_pct(ask_long=long_quote.best_ask_price, bid_short=short_quote.best_bid_price)
-            position.max_adverse_spread_pct = min(position.max_adverse_spread_pct, current_spread_pct)
-            position.max_favorable_spread_pct = max(position.max_favorable_spread_pct, current_spread_pct)
+            if age_long_ms <= tracking_fresh_max_age_ms and age_short_ms <= tracking_fresh_max_age_ms:
+                position.max_adverse_spread_pct = min(position.max_adverse_spread_pct, current_spread_pct)
+                position.max_favorable_spread_pct = max(position.max_favorable_spread_pct, current_spread_pct)
 
             hold_seconds = (now - position.opened_at).total_seconds()
             stop_threshold = position.entry_rolling_mean + (self.settings.mr_sigma_stop * position.entry_rolling_std)
@@ -265,7 +267,7 @@ class MeanReversionEngine:
                 close_reason = "stop_loss"
             elif hold_seconds >= self.settings.mr_max_hold_seconds:
                 close_reason = "timeout"
-            elif age_long_ms > max_age_ms or age_short_ms > max_age_ms:
+            elif age_long_ms > exit_max_age_ms or age_short_ms > exit_max_age_ms:
                 close_reason = "stale_quote"
 
             if close_reason is not None:
@@ -316,6 +318,10 @@ class MeanReversionEngine:
         direction: str,
         now: datetime,
     ) -> None:
+        excluded = set(self.settings.mr_excluded_exchanges)
+        if long_exchange.value in excluded or short_exchange.value in excluded:
+            return
+
         key = (symbol, long_exchange, short_exchange)
         baseline = self.baselines.get(key)
         if baseline is None or not baseline.is_ready:

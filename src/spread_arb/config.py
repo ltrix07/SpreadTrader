@@ -79,6 +79,8 @@ class Settings(BaseSettings):
     mr_notional_usdt: float = Field(default=350.0, gt=0)
     mr_max_hold_seconds: int = Field(default=900, ge=1)
     mr_cooldown_sec: int = Field(default=30, ge=0)
+    mr_exit_max_quote_age_ms: int = Field(default=10_000, ge=1)
+    mr_excluded_exchanges: list[str] = Field(default_factory=lambda: ["htx"])
 
     use_websocket: bool = True
 
@@ -121,6 +123,14 @@ class Settings(BaseSettings):
         parsed = cls._parse_list_env(value)
         if isinstance(parsed, list):
             return [item.upper() for item in parsed]
+        return parsed
+
+    @field_validator("mr_excluded_exchanges", mode="before")
+    @classmethod
+    def _parse_mr_excluded_exchanges(cls, value: Any) -> Any:
+        parsed = cls._parse_list_env(value)
+        if isinstance(parsed, list):
+            return [item.lower() for item in parsed]
         return parsed
 
 
