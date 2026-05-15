@@ -29,21 +29,16 @@ class Settings(BaseSettings):
     ])
     market_type: str = "perp"
     symbols: list[Symbol] = Field(default_factory=lambda: [
-        # ── Large caps (baseline, tight spreads) ──
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
-        # ── Mid caps ──
         "ADAUSDT", "AVAXUSDT", "LINKUSDT", "APTUSDT", "ARBUSDT",
         "OPUSDT", "SUIUSDT", "SEIUSDT", "WIFUSDT", "PEPEUSDT",
         "FLOKIUSDT", "INJUSDT", "NEARUSDT", "ORDIUSDT",
         "1000BONKUSDT",
-        # ── Established mid-caps (likely wider spreads on smaller exchanges) ──
         "DOTUSDT", "ATOMUSDT", "FILUSDT", "UNIUSDT", "LDOUSDT",
         "AAVEUSDT", "GRTUSDT", "RUNEUSDT", "TIAUSDT", "STXUSDT",
-        # ── Newer / lower liquidity (potentially widest spreads) ──
         "FETUSDT", "PENDLEUSDT", "JUPUSDT", "ENAUSDT", "ONDOUSDT",
         "ZKUSDT", "STRKUSDT", "BLURUSDT", "DYDXUSDT", "GALAUSDT",
         "CFXUSDT", "IMXUSDT", "GMXUSDT", "MASKUSDT", "WOOUSDT",
-        # ── Small / meme (max spread potential) ──
         "ACHUSDT", "CELOUSDT", "LRCUSDT", "SKLUSDT", "ZENUSDT",
     ])
 
@@ -73,6 +68,7 @@ class Settings(BaseSettings):
     mr_enabled: bool = True
     mr_sigma_entry: float = Field(default=3.0, gt=0)
     mr_sigma_stop: float = Field(default=6.0, gt=0)
+    mr_min_stop_distance_pct: float = Field(default=0.15, ge=0)
     mr_rolling_window: int = Field(default=360, ge=30)
     mr_min_net_edge_pct: float = Field(default=0.40, ge=0)
     mr_max_positions: int = Field(default=1, ge=1)
@@ -82,8 +78,8 @@ class Settings(BaseSettings):
     mr_exit_max_quote_age_ms: int = Field(default=30_000, ge=1)
     mr_take_profit_fraction: float = Field(default=0.75, gt=0, le=1.0)
     mr_excluded_exchanges: list[str] = Field(default_factory=lambda: ["htx"])
-    mr_quote_freshness_window: int = Field(default=30, ge=5)  # track last N baseline cycles (30 × 10s = 5 min)
-    mr_min_quote_freshness_pct: float = Field(default=80.0, ge=0, le=100)  # require 80%+ fresh quotes to enter
+    mr_quote_freshness_window: int = Field(default=30, ge=5)
+    mr_min_quote_freshness_pct: float = Field(default=80.0, ge=0, le=100)
 
     use_websocket: bool = True
 

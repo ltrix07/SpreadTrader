@@ -100,6 +100,8 @@ class PendingMrEntry:
 
 
 class MeanReversionEngine:
+    _FALLBACK_FEE_PCT = 0.10  # Conservative fallback for unknown exchanges.
+
     def __init__(
         self,
         *,
@@ -292,6 +294,17 @@ class MeanReversionEngine:
         window = self._freshness.get(key)
         return window is not None and len(window) >= min(10, self._freshness_window_size)
 
+    def _get_fee_pct(self, exchange: ExchangeName) -> float:
+        fee = self.exchange_fees_pct.get(exchange)
+        if fee is None:
+            self.log.warning(
+                "no fee configured for %s, using fallback %.2f%%",
+                exchange.value,
+                self._FALLBACK_FEE_PCT,
+            )
+            return self._FALLBACK_FEE_PCT
+        return fee
+
     def update_baselines(self, snapshot_quotes: dict[tuple[ExchangeName, str], Quote]) -> None:
         now = datetime.now(UTC)
         quotes_by_symbol: dict[str, dict[ExchangeName, Quote]] = {}
@@ -375,17 +388,48 @@ class MeanReversionEngine:
                 position.max_favorable_spread_pct = max(position.max_favorable_spread_pct, current_spread_pct)
 
             hold_seconds = (now - position.opened_at).total_seconds()
-            stop_threshold = position.entry_rolling_mean + (self.settings.mr_sigma_stop * position.entry_rolling_std)
+            sigma_stop = position.entry_rolling_mean + (self.settings.mr_sigma_stop * position.entry_rolling_std)
+            min_abs_stop = position.entry_spread_pct + self.settings.mr_min_stop_distance_pct
+            stop_threshold = max(sigma_stop, min_abs_stop)
 
             close_reason: str | None = None
-            if current_spread_pct <= position.take_profit_target:
-                close_reason = "mean_reversion"
-            elif current_spread_pct > stop_threshold:
+            if current_spread_pct > stop_threshold:
                 close_reason = "stop_loss"
             elif hold_seconds >= self.settings.mr_max_hold_seconds:
                 close_reason = "timeout"
             elif age_long_ms > exit_max_age_ms or age_short_ms > exit_max_age_ms:
                 close_reason = "stale_quote"
+            elif current_spread_pct <= position.take_profit_target:
+                est_exit_long = float(long_quote.best_bid_price)
+                est_exit_short = float(short_quote.best_ask_price)
+                exit_fees = _one_side_fees_usdt(
+                    notional_usdt=position.notional_usdt,
+                    fee_long_pct=self._get_fee_pct(position.long_exchange),
+                    fee_short_pct=self._get_fee_pct(position.short_exchange),
+                )
+                exit_slippage = _one_side_slippage_usdt(
+                    notional_usdt=position.notional_usdt,
+                    slippage_buffer_pct=self.settings.slippage_buffer_pct,
+                )
+                est_pnl = calculate_pnl(
+                    notional_usdt=position.notional_usdt,
+                    entry_long_price=position.entry_long_price,
+                    entry_short_price=position.entry_short_price,
+                    exit_long_price=est_exit_long,
+                    exit_short_price=est_exit_short,
+                    entry_fees_usdt=position.estimated_entry_fees_usdt,
+                    exit_fees_usdt=exit_fees,
+                    entry_slippage_usdt=position.estimated_entry_slippage_usdt,
+                    exit_slippage_usdt=exit_slippage,
+                )
+                if est_pnl.net_pnl_usdt > 0:
+                    close_reason = "mean_reversion"
+                else:
+                    self.log.debug(
+                        "mr exit guard | %s | spread reached target but est_pnl=%+.2f - holding",
+                        symbol,
+                        est_pnl.net_pnl_usdt,
+                    )
 
             if close_reason is not None:
                 self._close_position(
@@ -460,8 +504,8 @@ class MeanReversionEngine:
 
         sigma = _sigma_from(mean=mean, std=std, spread_pct=spread_pct)
         roundtrip_cost_pct = _roundtrip_cost_pct(
-            fee_long_pct=self.exchange_fees_pct.get(long_exchange, 0.0),
-            fee_short_pct=self.exchange_fees_pct.get(short_exchange, 0.0),
+            fee_long_pct=self._get_fee_pct(long_exchange),
+            fee_short_pct=self._get_fee_pct(short_exchange),
             slippage_buffer_pct=self.settings.slippage_buffer_pct,
             safety_buffer_pct=self.settings.safety_buffer_pct,
         )
@@ -571,8 +615,8 @@ class MeanReversionEngine:
             if current_spread_pct <= threshold:
                 return
             roundtrip_cost_pct = _roundtrip_cost_pct(
-                fee_long_pct=self.exchange_fees_pct.get(current.long_exchange, 0.0),
-                fee_short_pct=self.exchange_fees_pct.get(current.short_exchange, 0.0),
+                fee_long_pct=self._get_fee_pct(current.long_exchange),
+                fee_short_pct=self._get_fee_pct(current.short_exchange),
                 slippage_buffer_pct=self.settings.slippage_buffer_pct,
                 safety_buffer_pct=self.settings.safety_buffer_pct,
             )
@@ -583,8 +627,8 @@ class MeanReversionEngine:
 
             entry_fees_usdt = _one_side_fees_usdt(
                 notional_usdt=self.settings.mr_notional_usdt,
-                fee_long_pct=self.exchange_fees_pct.get(current.long_exchange, 0.0),
-                fee_short_pct=self.exchange_fees_pct.get(current.short_exchange, 0.0),
+                fee_long_pct=self._get_fee_pct(current.long_exchange),
+                fee_short_pct=self._get_fee_pct(current.short_exchange),
             )
             entry_slippage_usdt = _one_side_slippage_usdt(
                 notional_usdt=self.settings.mr_notional_usdt,
@@ -660,8 +704,8 @@ class MeanReversionEngine:
 
         exit_fees_usdt = _one_side_fees_usdt(
             notional_usdt=position.notional_usdt,
-            fee_long_pct=self.exchange_fees_pct.get(position.long_exchange, 0.0),
-            fee_short_pct=self.exchange_fees_pct.get(position.short_exchange, 0.0),
+            fee_long_pct=self._get_fee_pct(position.long_exchange),
+            fee_short_pct=self._get_fee_pct(position.short_exchange),
         )
         exit_slippage_usdt = _one_side_slippage_usdt(
             notional_usdt=position.notional_usdt,

@@ -332,7 +332,7 @@ class QuoteScanner:
                 age_ms = (now - ts).total_seconds() * 1000.0
                 if age_ms > max_age_ms:
                     exchange, symbol = key
-                    self.log.warning(
+                    self.log.debug(
                         "stale quote detected | %s | %s | age_ms=%.0f > max=%d",
                         exchange.value,
                         symbol,
