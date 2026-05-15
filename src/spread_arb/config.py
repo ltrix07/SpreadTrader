@@ -58,8 +58,8 @@ class Settings(BaseSettings):
     max_hold_seconds: int = Field(default=900, ge=1)
     simulated_execution_delay_ms: int = Field(default=500, ge=0)
     max_quote_age_ms: int = Field(default=2000, ge=1)
-    slippage_buffer_pct: float = Field(default=0.05, ge=0)
-    safety_buffer_pct: float = Field(default=0.05, ge=0)
+    slippage_buffer_pct: float = Field(default=0.01, ge=0)
+    safety_buffer_pct: float = Field(default=0.01, ge=0)
 
     taker_fee_mexc_pct: float = Field(default=0.05, ge=0)
     taker_fee_bybit_pct: float = Field(default=0.055, ge=0)
@@ -71,17 +71,19 @@ class Settings(BaseSettings):
 
     # Mean reversion settings
     mr_enabled: bool = True
-    mr_sigma_entry: float = Field(default=2.0, gt=0)
-    mr_sigma_stop: float = Field(default=4.0, gt=0)
+    mr_sigma_entry: float = Field(default=3.0, gt=0)
+    mr_sigma_stop: float = Field(default=6.0, gt=0)
     mr_rolling_window: int = Field(default=360, ge=30)
-    mr_min_net_edge_pct: float = Field(default=0.10, ge=0)
+    mr_min_net_edge_pct: float = Field(default=0.40, ge=0)
     mr_max_positions: int = Field(default=1, ge=1)
     mr_notional_usdt: float = Field(default=350.0, gt=0)
     mr_max_hold_seconds: int = Field(default=900, ge=1)
     mr_cooldown_sec: int = Field(default=30, ge=0)
     mr_exit_max_quote_age_ms: int = Field(default=30_000, ge=1)
-    mr_take_profit_fraction: float = Field(default=0.5, gt=0, le=1.0)
+    mr_take_profit_fraction: float = Field(default=0.75, gt=0, le=1.0)
     mr_excluded_exchanges: list[str] = Field(default_factory=lambda: ["htx"])
+    mr_quote_freshness_window: int = Field(default=30, ge=5)  # track last N baseline cycles (30 × 10s = 5 min)
+    mr_min_quote_freshness_pct: float = Field(default=80.0, ge=0, le=100)  # require 80%+ fresh quotes to enter
 
     use_websocket: bool = True
 

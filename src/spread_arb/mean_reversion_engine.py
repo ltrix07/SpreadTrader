@@ -116,6 +116,12 @@ class MeanReversionEngine:
         self.baseline_ready_keys: set[tuple[str, ExchangeName, ExchangeName]] = set()
         self._preloading = False
 
+        # Quote freshness tracker: per (exchange, symbol) rolling window of booleans
+        # True = quote was fresh (< max_quote_age_ms) at baseline check time
+        self._freshness_window_size = self.settings.mr_quote_freshness_window
+        self._freshness: dict[tuple[ExchangeName, str], deque[bool]] = {}
+        self._min_freshness_pct = self.settings.mr_min_quote_freshness_pct
+
         self.pending_entries_by_symbol: dict[str, PendingMrEntry] = {}
         self.open_positions_by_symbol: dict[str, MeanRevPosition] = {}
         self.last_closed_by_symbol: dict[str, datetime] = {}
@@ -263,11 +269,40 @@ class MeanReversionEngine:
             top_symbols_text,
         )
 
+    def _update_freshness(self, exchange: ExchangeName, symbol: str, is_fresh: bool) -> None:
+        """Track whether a quote was fresh at this baseline check."""
+        key = (exchange, symbol)
+        window = self._freshness.get(key)
+        if window is None:
+            window = deque(maxlen=self._freshness_window_size)
+            self._freshness[key] = window
+        window.append(is_fresh)
+
+    def _get_freshness_pct(self, exchange: ExchangeName, symbol: str) -> float:
+        """Return percentage of recent baseline checks where quote was fresh."""
+        key = (exchange, symbol)
+        window = self._freshness.get(key)
+        if window is None or len(window) == 0:
+            return 0.0
+        return sum(window) / len(window) * 100.0
+
+    def _freshness_ready(self, exchange: ExchangeName, symbol: str) -> bool:
+        """Has enough freshness history to make a judgment."""
+        key = (exchange, symbol)
+        window = self._freshness.get(key)
+        return window is not None and len(window) >= min(10, self._freshness_window_size)
+
     def update_baselines(self, snapshot_quotes: dict[tuple[ExchangeName, str], Quote]) -> None:
         now = datetime.now(UTC)
         quotes_by_symbol: dict[str, dict[ExchangeName, Quote]] = {}
         for (exchange, symbol), quote in snapshot_quotes.items():
             quotes_by_symbol.setdefault(symbol, {})[exchange] = quote
+
+        # Update freshness tracker for all quotes
+        freshness_threshold_ms = float(self.settings.max_quote_age_ms)
+        for (exchange, symbol), quote in snapshot_quotes.items():
+            age_ms = (now - quote.received_at).total_seconds() * 1000.0
+            self._update_freshness(exchange, symbol, age_ms <= freshness_threshold_ms)
 
         for symbol, exchange_quotes in quotes_by_symbol.items():
             if len(exchange_quotes) < 2:
@@ -405,6 +440,13 @@ class MeanReversionEngine:
         if long_exchange.value in excluded or short_exchange.value in excluded:
             return
 
+        # Quote freshness filter: reject pairs where quotes are unreliable
+        if self._freshness_ready(long_exchange, symbol) and self._freshness_ready(short_exchange, symbol):
+            long_fresh = self._get_freshness_pct(long_exchange, symbol)
+            short_fresh = self._get_freshness_pct(short_exchange, symbol)
+            if long_fresh < self._min_freshness_pct or short_fresh < self._min_freshness_pct:
+                return
+
         key = (symbol, long_exchange, short_exchange)
         baseline = self.baselines.get(key)
         if baseline is None or not baseline.is_ready:
@@ -426,8 +468,10 @@ class MeanReversionEngine:
         expected_edge_pct = spread_pct - mean
         net_edge_pct = expected_edge_pct - roundtrip_cost_pct
 
+        long_fresh_pct = self._get_freshness_pct(long_exchange, symbol)
+        short_fresh_pct = self._get_freshness_pct(short_exchange, symbol)
         self.log.info(
-            "mr signal | %s %s->%s | spread=%+.4f%% | mean=%+.4f%% | std=%.4f%% | sigma=%.2f | net_edge=%+.4f%%",
+            "mr signal | %s %s->%s | spread=%+.4f%% | mean=%+.4f%% | std=%.4f%% | sigma=%.2f | net_edge=%+.4f%% | fresh=%.0f%%/%.0f%%",
             symbol,
             long_exchange.value,
             short_exchange.value,
@@ -436,6 +480,8 @@ class MeanReversionEngine:
             std,
             sigma,
             net_edge_pct,
+            long_fresh_pct,
+            short_fresh_pct,
         )
 
         if net_edge_pct < self.settings.mr_min_net_edge_pct:
