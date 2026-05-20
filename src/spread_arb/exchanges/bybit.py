@@ -258,8 +258,16 @@ class BybitExchange(ExchangeClient):
                     or "0"
                 )
                 self.log.info(
-                    "bybit balance raw | total=%s available=%s | coin_fields=%s | acct_available=%s",
-                    total, available, list(coin_info.keys()), acct_available,
+                    "bybit balance raw | walletBalance=%s equity=%s bonus=%s locked=%s "
+                    "totalOrderIM=%s totalPositionIM=%s availableToWithdraw=%s acct_available=%s",
+                    coin_info.get("walletBalance"),
+                    coin_info.get("equity"),
+                    coin_info.get("bonus"),
+                    coin_info.get("locked"),
+                    coin_info.get("totalOrderIM"),
+                    coin_info.get("totalPositionIM"),
+                    coin_info.get("availableToWithdraw"),
+                    acct_available,
                 )
                 return BalanceInfo(
                     exchange=self.name,
