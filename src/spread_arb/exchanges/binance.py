@@ -142,7 +142,10 @@ class BinanceExchange(ExchangeClient):
             "side": side.upper(),
             "type": "MARKET",
             "quantity": str(self._to_exchange_qty(symbol, qty)),
+            "newOrderRespType": "RESULT",
         }
+        if close:
+            params["reduceOnly"] = "true"
         data = await self._signed_request("POST", "/fapi/v1/order", params)
         return OrderResult(
             exchange=self.name,
@@ -172,21 +175,32 @@ class BinanceExchange(ExchangeClient):
             "type": "STOP_MARKET",
             "stopPrice": str(stop_price),
             "quantity": str(self._to_exchange_qty(symbol, qty)),
-            "closePosition": "false",
+            "algoType": "CONDITIONAL",
         }
-        data = await self._signed_request("POST", "/fapi/v1/order", params)
-        return str(data.get("orderId", ""))
+        data = await self._signed_request("POST", "/fapi/v1/algoOrder", params)
+        return str(data.get("algoId", data.get("orderId", "")))
 
     async def cancel_order(self, symbol: str, order_id: str) -> None:
         bn_symbol = self._to_binance_symbol(symbol)
-        await self._signed_request(
-            "DELETE",
-            "/fapi/v1/order",
-            {
-                "symbol": bn_symbol,
-                "orderId": order_id,
-            },
-        )
+        # Try algo order cancel first (for stop orders), fallback to regular
+        try:
+            await self._signed_request(
+                "DELETE",
+                "/fapi/v1/algoOrder",
+                {
+                    "symbol": bn_symbol,
+                    "algoId": order_id,
+                },
+            )
+        except RuntimeError:
+            await self._signed_request(
+                "DELETE",
+                "/fapi/v1/order",
+                {
+                    "symbol": bn_symbol,
+                    "orderId": order_id,
+                },
+            )
 
     async def set_leverage(self, symbol: str, leverage: int) -> None:
         bn_symbol = self._to_binance_symbol(symbol)
