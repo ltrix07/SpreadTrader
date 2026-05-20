@@ -14,8 +14,11 @@ from .signing import hmac_sha256_hex, timestamp_ms
 
 
 class MexcExchange(ExchangeClient):
-    base_url = "https://contract.mexc.com"
+    # MEXC futures API domain was migrated to api.mexc.com in Jan 2026.
+    # Keep legacy domains only as fallbacks.
+    base_url = "https://api.mexc.com"
     _PRIVATE_POST_BASE_URLS = (
+        "https://api.mexc.com",
         "https://contract.mexc.com",
         "https://futures.mexc.com",
     )
