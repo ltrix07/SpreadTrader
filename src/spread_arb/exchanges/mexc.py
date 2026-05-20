@@ -15,6 +15,10 @@ from .signing import hmac_sha256_hex, timestamp_ms
 
 class MexcExchange(ExchangeClient):
     base_url = "https://contract.mexc.com"
+    _PRIVATE_POST_BASE_URLS = (
+        "https://contract.mexc.com",
+        "https://futures.mexc.com",
+    )
     inter_request_delay_sec = 0.12  # ~120ms between requests to stay under MEXC rate limit.
 
     def __init__(
@@ -111,7 +115,6 @@ class MexcExchange(ExchangeClient):
         sign_payload = f"{self.api_key}{ts}{request_param_str}"
         signature = hmac_sha256_hex(self.api_secret, sign_payload)
 
-        url = f"{self.base_url}{path}"
         headers = {
             "ApiKey": self.api_key,
             "Request-Time": ts,
@@ -123,37 +126,77 @@ class MexcExchange(ExchangeClient):
             "source": "CCXT",
         }
 
-        if method_upper == "GET":
-            req_url = f"{url}?{request_param_str}" if request_param_str else url
-            request_kwargs: dict[str, object] = {}
-        elif method_upper == "DELETE":
-            req_url = f"{url}?{request_param_str}" if request_param_str else url
-            request_kwargs = {}
+        if method_upper == "POST" and path.startswith("/api/v1/private/"):
+            candidate_bases = list(self._PRIVATE_POST_BASE_URLS)
+            if self.base_url not in candidate_bases:
+                candidate_bases.insert(0, self.base_url)
         else:
-            req_url = url
-            request_kwargs = {"data": request_body_str}
+            candidate_bases = [self.base_url]
 
-        async with self.session.request(
-            method_upper,
-            req_url,
-            headers=headers,
-            timeout=self.request_timeout_sec,
-            **request_kwargs,
-        ) as response:
-            try:
-                data = await response.json(content_type=None)
-            except (ContentTypeError, json.JSONDecodeError):
-                text = await response.text()
-                snippet = " ".join(text.strip().split())[:300]
-                raise RuntimeError(
-                    f"MEXC HTTP {response.status} non-JSON response at {path}: {snippet}"
-                ) from None
+        last_error: RuntimeError | None = None
+        for base_url in candidate_bases:
+            url = f"{base_url}{path}"
+            if method_upper == "GET":
+                req_url = f"{url}?{request_param_str}" if request_param_str else url
+                request_kwargs: dict[str, object] = {}
+            elif method_upper == "DELETE":
+                req_url = f"{url}?{request_param_str}" if request_param_str else url
+                request_kwargs = {}
+            else:
+                req_url = url
+                request_kwargs = {"data": request_body_str}
 
-        if not data.get("success", True):
-            raise RuntimeError(f"MEXC API error: {data}")
-        if data.get("code") not in (None, 0):
-            raise RuntimeError(f"MEXC API error: {data}")
-        return data.get("data", data)
+            async with self.session.request(
+                method_upper,
+                req_url,
+                headers=headers,
+                timeout=self.request_timeout_sec,
+                **request_kwargs,
+            ) as response:
+                try:
+                    data = await response.json(content_type=None)
+                except (ContentTypeError, json.JSONDecodeError):
+                    text = await response.text()
+                    snippet = " ".join(text.strip().split())[:300]
+                    err = RuntimeError(
+                        f"MEXC HTTP {response.status} non-JSON response at {path} via {base_url}: {snippet}"
+                    )
+                    # Try alternate host only for WAF-style Access Denied HTML.
+                    if (
+                        method_upper == "POST"
+                        and "access denied" in text.lower()
+                        and base_url != candidate_bases[-1]
+                    ):
+                        last_error = err
+                        continue
+                    raise err from None
+
+            if not data.get("success", True):
+                err = RuntimeError(f"MEXC API error: {data}")
+                # Retry on alternate private POST host for gateway-level errors.
+                if (
+                    method_upper == "POST"
+                    and base_url != candidate_bases[-1]
+                    and data.get("code") in {401, 402, 406, 510, 511}
+                ):
+                    last_error = err
+                    continue
+                raise err
+            if data.get("code") not in (None, 0):
+                err = RuntimeError(f"MEXC API error: {data}")
+                if (
+                    method_upper == "POST"
+                    and base_url != candidate_bases[-1]
+                    and data.get("code") in {401, 402, 406, 510, 511}
+                ):
+                    last_error = err
+                    continue
+                raise err
+            return data.get("data", data)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"MEXC request failed without response data for {path}")
 
     async def _contract_detail(self, symbol: str) -> dict:
         mexc_symbol = self._to_mexc_symbol(symbol)
