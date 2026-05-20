@@ -52,6 +52,7 @@ class BitgetExchange(ExchangeClient):
             **kwargs,
         )
         self.passphrase = passphrase
+        self._pos_mode_cache: str | None = None
 
     @property
     def name(self) -> ExchangeName:
@@ -170,6 +171,46 @@ class BitgetExchange(ExchangeClient):
             raise RuntimeError(f"Bitget API error: {data}")
         return data.get("data", data)
 
+    async def _get_position_mode_and_hold_side(self, symbol: str) -> tuple[str | None, str | None]:
+        """Fetch current position mode and active hold side for a symbol."""
+        bitget_symbol = self._to_bitget_symbol(symbol)
+        path = "/api/v2/mix/position/single-position?" + urlencode({
+            "symbol": bitget_symbol,
+            "productType": "USDT-FUTURES",
+            "marginCoin": "USDT",
+        })
+        try:
+            data = await self._signed_request("GET", path)
+        except Exception:
+            return self._pos_mode_cache, None
+
+        positions = data if isinstance(data, list) else data.get("list") or []
+        if not positions:
+            return self._pos_mode_cache, None
+
+        active = next((
+            item for item in positions
+            if Decimal(str(item.get("total") or "0")) > 0
+        ), positions[0])
+
+        pos_mode_raw = str(active.get("posMode") or "").lower()
+        hold_side_raw = str(active.get("holdSide") or "").lower()
+        pos_mode = pos_mode_raw if pos_mode_raw in {"one_way_mode", "hedge_mode"} else None
+        hold_side = hold_side_raw if hold_side_raw in {"long", "short"} else None
+        if pos_mode:
+            self._pos_mode_cache = pos_mode
+        return pos_mode, hold_side
+
+    @staticmethod
+    def _map_close_side_for_hedge_mode(requested_side: str, hold_side: str | None) -> str:
+        """Map canonical close side (sell closes long) to Bitget hedge-mode side."""
+        if hold_side == "long":
+            return "buy"
+        if hold_side == "short":
+            return "sell"
+        # Fallback when holdSide is unavailable: infer from canonical close intent.
+        return "buy" if requested_side == "sell" else "sell"
+
     async def place_market_order(
         self,
         symbol: str,
@@ -186,20 +227,41 @@ class BitgetExchange(ExchangeClient):
             "marginMode": "crossed",
             "marginCoin": "USDT",
             "side": side_lower,
-            "tradeSide": "close" if close else "open",
             "orderType": "market",
             "size": str(exchange_qty),
         }
+
         if close:
             # Give Bitget time to settle the position before closing.
             await asyncio.sleep(1.0)
+            pos_mode, hold_side = await self._get_position_mode_and_hold_side(symbol)
+            if pos_mode == "hedge_mode":
+                body["tradeSide"] = "close"
+                body["side"] = self._map_close_side_for_hedge_mode(side_lower, hold_side)
+            elif pos_mode == "one_way_mode":
+                body["reduceOnly"] = "YES"
+            else:
+                # Fallback for unknown mode; Bitget ignores tradeSide in one-way mode.
+                body["tradeSide"] = "close"
+        else:
+            # In one-way mode tradeSide is ignored; in hedge mode this is required.
+            body["tradeSide"] = "open"
+
         try:
             data = await self._signed_request("POST", "/api/v2/mix/order/place-order", body)
         except RuntimeError as exc:
             if close and "22002" in str(exc):
-                # Position may not be settled yet — retry once after delay.
-                self.log.warning("Bitget 'No position to close' — retrying after 2s")
+                # Position may not be settled yet; refresh mode and retry once.
+                self.log.warning("Bitget 'No position to close' - retrying after 2s")
                 await asyncio.sleep(2.0)
+                pos_mode, hold_side = await self._get_position_mode_and_hold_side(symbol)
+                if pos_mode == "hedge_mode":
+                    body["tradeSide"] = "close"
+                    body["side"] = self._map_close_side_for_hedge_mode(side_lower, hold_side)
+                elif pos_mode == "one_way_mode":
+                    body.pop("tradeSide", None)
+                    body["side"] = side_lower
+                    body["reduceOnly"] = "YES"
                 data = await self._signed_request("POST", "/api/v2/mix/order/place-order", body)
             else:
                 raise
@@ -329,23 +391,28 @@ class BitgetExchange(ExchangeClient):
         exchange_qty = self._to_exchange_qty(symbol, qty)
         # Round trigger price to 2 decimal places (Bitget rejects excess precision).
         rounded_stop = stop_price.quantize(Decimal("0.01"))
-        data = await self._signed_request(
-            "POST",
-            "/api/v2/mix/order/place-plan-order",
-            {
-                "planType": "normal_plan",
-                "symbol": bitget_symbol,
-                "productType": "USDT-FUTURES",
-                "marginMode": "crossed",
-                "marginCoin": "USDT",
-                "side": side_lower,
-                "orderType": "market",
-                "size": str(exchange_qty),
-                "triggerPrice": str(rounded_stop),
-                "triggerType": "mark_price",
-                "reduceOnly": "YES",
-            },
-        )
+        pos_mode, hold_side = await self._get_position_mode_and_hold_side(symbol)
+
+        request_body: dict[str, str] = {
+            "planType": "normal_plan",
+            "symbol": bitget_symbol,
+            "productType": "USDT-FUTURES",
+            "marginMode": "crossed",
+            "marginCoin": "USDT",
+            "side": side_lower,
+            "orderType": "market",
+            "size": str(exchange_qty),
+            "triggerPrice": str(rounded_stop),
+            "triggerType": "mark_price",
+        }
+        if pos_mode == "hedge_mode":
+            request_body["tradeSide"] = "close"
+            request_body["side"] = self._map_close_side_for_hedge_mode(side_lower, hold_side)
+        else:
+            # Plan-order reduceOnly in one-way mode expects lower-case yes/no.
+            request_body["reduceOnly"] = "yes"
+
+        data = await self._signed_request("POST", "/api/v2/mix/order/place-plan-order", request_body)
         return str(data.get("orderId", ""))
 
     async def cancel_order(self, symbol: str, order_id: str) -> None:
