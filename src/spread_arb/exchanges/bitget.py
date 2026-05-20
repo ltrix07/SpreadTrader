@@ -180,6 +180,13 @@ class BitgetExchange(ExchangeClient):
         bitget_symbol = self._to_bitget_symbol(symbol)
         exchange_qty = self._to_exchange_qty(symbol, qty)
         side_lower = side.lower()
+        # Hedge mode requires holdSide on every order.
+        # open buy → long, open sell → short
+        # close sell → long (closing long), close buy → short (closing short)
+        if close:
+            hold_side = "long" if side_lower == "sell" else "short"
+        else:
+            hold_side = "long" if side_lower == "buy" else "short"
         body: dict[str, str] = {
             "symbol": bitget_symbol,
             "productType": "USDT-FUTURES",
@@ -187,13 +194,10 @@ class BitgetExchange(ExchangeClient):
             "marginCoin": "USDT",
             "side": side_lower,
             "tradeSide": "close" if close else "open",
+            "holdSide": hold_side,
             "orderType": "market",
             "size": str(exchange_qty),
         }
-        if close:
-            # Hedge mode: holdSide tells Bitget which position to close.
-            # sell close → closing a long; buy close → closing a short.
-            body["holdSide"] = "long" if side_lower == "sell" else "short"
         data = await self._signed_request("POST", "/api/v2/mix/order/place-order", body)
         order_id = str(data.get("orderId", ""))
 
@@ -327,7 +331,7 @@ class BitgetExchange(ExchangeClient):
             "POST",
             "/api/v2/mix/order/place-plan-order",
             {
-                "planType": "loss_plan",
+                "planType": "normal_plan",
                 "symbol": bitget_symbol,
                 "productType": "USDT-FUTURES",
                 "marginMode": "crossed",
