@@ -32,6 +32,7 @@ LIVE_EXCHANGES = {
     ExchangeName.BINANCE: "binance",
     ExchangeName.OKX: "okx",
     ExchangeName.BYBIT: "bybit",
+    ExchangeName.BITGET: "bitget",
     ExchangeName.MEXC: "mexc",
 }
 
@@ -63,6 +64,15 @@ def get_client_and_creds(settings: Any, exchange: ExchangeName, session: aiohttp
             api_key=settings.api_key_bybit,
             api_secret=settings.api_secret_bybit,
         )
+    if exchange == ExchangeName.BITGET:
+        from spread_arb.exchanges.bitget import BitgetExchange
+        return BitgetExchange(
+            session=session,
+            request_timeout_sec=settings.request_timeout_sec,
+            api_key=settings.api_key_bitget,
+            api_secret=settings.api_secret_bitget,
+            passphrase=settings.api_passphrase_bitget,
+        )
     if exchange == ExchangeName.MEXC:
         from spread_arb.exchanges.mexc import MexcExchange
         return MexcExchange(
@@ -85,6 +95,12 @@ def has_credentials(settings: Any, exchange: ExchangeName) -> bool:
         )
     if exchange == ExchangeName.BYBIT:
         return bool(settings.api_key_bybit.strip() and settings.api_secret_bybit.strip())
+    if exchange == ExchangeName.BITGET:
+        return bool(
+            settings.api_key_bitget.strip()
+            and settings.api_secret_bitget.strip()
+            and settings.api_passphrase_bitget.strip()
+        )
     if exchange == ExchangeName.MEXC:
         return bool(settings.api_key_mexc.strip() and settings.api_secret_mexc.strip())
     return False
