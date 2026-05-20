@@ -34,7 +34,9 @@ if [[ -z "${START_TS:-}" ]]; then
   exit 1
 fi
 
-END_TS="$(date -d "$START_TS +${MINUTES} minutes" '+%Y-%m-%d %H:%M:%S')"
+START_EPOCH="$(date -d "$START_TS" '+%s')"
+END_EPOCH="$((START_EPOCH + MINUTES * 60))"
+END_TS="$(date -d "@$END_EPOCH" '+%Y-%m-%d %H:%M:%S')"
 
 awk -v s="$START_TS" -v e="$END_TS" '
   length($0)>=19 {
