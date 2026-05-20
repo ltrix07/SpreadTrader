@@ -180,20 +180,29 @@ class BitgetExchange(ExchangeClient):
         bitget_symbol = self._to_bitget_symbol(symbol)
         exchange_qty = self._to_exchange_qty(symbol, qty)
         side_lower = side.lower()
-        # One-way mode: do NOT send tradeSide at all.
-        # Use reduceOnly="YES" to close instead.
         body: dict[str, str] = {
             "symbol": bitget_symbol,
             "productType": "USDT-FUTURES",
             "marginMode": "crossed",
             "marginCoin": "USDT",
             "side": side_lower,
+            "tradeSide": "close" if close else "open",
             "orderType": "market",
             "size": str(exchange_qty),
         }
         if close:
-            body["reduceOnly"] = "YES"
-        data = await self._signed_request("POST", "/api/v2/mix/order/place-order", body)
+            # Give Bitget time to settle the position before closing.
+            await asyncio.sleep(1.0)
+        try:
+            data = await self._signed_request("POST", "/api/v2/mix/order/place-order", body)
+        except RuntimeError as exc:
+            if close and "22002" in str(exc):
+                # Position may not be settled yet — retry once after delay.
+                self.log.warning("Bitget 'No position to close' — retrying after 2s")
+                await asyncio.sleep(2.0)
+                data = await self._signed_request("POST", "/api/v2/mix/order/place-order", body)
+            else:
+                raise
         order_id = str(data.get("orderId", ""))
 
         await asyncio.sleep(0.5)
