@@ -180,13 +180,7 @@ class BitgetExchange(ExchangeClient):
         bitget_symbol = self._to_bitget_symbol(symbol)
         exchange_qty = self._to_exchange_qty(symbol, qty)
         side_lower = side.lower()
-        # Hedge mode requires holdSide on every order.
-        # open buy → long, open sell → short
-        # close sell → long (closing long), close buy → short (closing short)
-        if close:
-            hold_side = "long" if side_lower == "sell" else "short"
-        else:
-            hold_side = "long" if side_lower == "buy" else "short"
+        # One-way mode: no holdSide needed. tradeSide open/close is sufficient.
         body: dict[str, str] = {
             "symbol": bitget_symbol,
             "productType": "USDT-FUTURES",
@@ -194,10 +188,11 @@ class BitgetExchange(ExchangeClient):
             "marginCoin": "USDT",
             "side": side_lower,
             "tradeSide": "close" if close else "open",
-            "holdSide": hold_side,
             "orderType": "market",
             "size": str(exchange_qty),
         }
+        if close:
+            body["reduceOnly"] = "YES"
         data = await self._signed_request("POST", "/api/v2/mix/order/place-order", body)
         order_id = str(data.get("orderId", ""))
 
@@ -228,22 +223,20 @@ class BitgetExchange(ExchangeClient):
 
     async def set_leverage(self, symbol: str, leverage: int) -> None:
         bitget_symbol = self._to_bitget_symbol(symbol)
-        for hold_side in ("long", "short"):
-            try:
-                await self._signed_request(
-                    "POST",
-                    "/api/v2/mix/account/set-leverage",
-                    {
-                        "symbol": bitget_symbol,
-                        "productType": "USDT-FUTURES",
-                        "marginCoin": "USDT",
-                        "leverage": str(leverage),
-                        "holdSide": hold_side,
-                    },
-                )
-            except RuntimeError as exc:
-                if "leverage" not in str(exc).lower():
-                    raise
+        try:
+            await self._signed_request(
+                "POST",
+                "/api/v2/mix/account/set-leverage",
+                {
+                    "symbol": bitget_symbol,
+                    "productType": "USDT-FUTURES",
+                    "marginCoin": "USDT",
+                    "leverage": str(leverage),
+                },
+            )
+        except RuntimeError as exc:
+            if "leverage" not in str(exc).lower():
+                raise
 
     async def get_balance(self) -> BalanceInfo:
         data = await self._signed_request("GET", "/api/v2/mix/account/accounts?productType=USDT-FUTURES")
@@ -325,8 +318,8 @@ class BitgetExchange(ExchangeClient):
         bitget_symbol = self._to_bitget_symbol(symbol)
         side_lower = side.lower()
         exchange_qty = self._to_exchange_qty(symbol, qty)
-        # holdSide: sell stop → closing long, buy stop → closing short.
-        hold_side = "long" if side_lower == "sell" else "short"
+        # Round trigger price to 2 decimal places (Bitget rejects excess precision).
+        rounded_stop = stop_price.quantize(Decimal("0.01"))
         data = await self._signed_request(
             "POST",
             "/api/v2/mix/order/place-plan-order",
@@ -338,11 +331,11 @@ class BitgetExchange(ExchangeClient):
                 "marginCoin": "USDT",
                 "side": side_lower,
                 "tradeSide": "close",
-                "holdSide": hold_side,
                 "orderType": "market",
                 "size": str(exchange_qty),
-                "triggerPrice": str(stop_price),
+                "triggerPrice": str(rounded_stop),
                 "triggerType": "mark_price",
+                "reduceOnly": "YES",
             },
         )
         return str(data.get("orderId", ""))
