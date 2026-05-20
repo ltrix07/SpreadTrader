@@ -10,6 +10,7 @@ from decimal import Decimal
 from typing import Callable
 
 from .config import Settings
+from .execution import ExecutionError, ExecutionService
 from .models import ExchangeName, Quote
 from .paper_engine import calculate_pnl
 from .storage import OpportunityStore, PaperTradeRecord
@@ -77,6 +78,10 @@ class MeanRevPosition:
     max_favorable_spread_pct: float
     estimated_entry_fees_usdt: float
     estimated_entry_slippage_usdt: float
+    actual_qty_long: Decimal | None = None
+    actual_qty_short: Decimal | None = None
+    long_stop_order_id: str = ""
+    short_stop_order_id: str = ""
 
 
 @dataclass(slots=True)
@@ -108,11 +113,23 @@ class MeanReversionEngine:
         settings: Settings,
         opportunity_store: OpportunityStore,
         get_latest_quote: Callable[[ExchangeName, str], Quote | None],
+        execution_service: ExecutionService | None = None,
     ) -> None:
         self.settings = settings
         self.opportunity_store = opportunity_store
         self.get_latest_quote = get_latest_quote
+        self.execution_service = execution_service
         self.log = logging.getLogger(__name__)
+        self.live_mode = settings.live_trading and execution_service is not None
+        if self.live_mode:
+            self.log.info("LIVE TRADING MODE ENABLED - real orders will be placed")
+        else:
+            self.log.info("Paper trading mode")
+            if self.settings.mr_compound_enabled:
+                self.log.info(
+                    "compound enabled but paper mode - using fixed notional $%.2f",
+                    self.settings.mr_notional_usdt,
+                )
 
         self.baselines: dict[tuple[str, ExchangeName, ExchangeName], RollingBaseline] = {}
         self.baseline_ready_keys: set[tuple[str, ExchangeName, ExchangeName]] = set()
@@ -126,6 +143,7 @@ class MeanReversionEngine:
 
         self.pending_entries_by_symbol: dict[str, PendingMrEntry] = {}
         self.open_positions_by_symbol: dict[str, MeanRevPosition] = {}
+        self.pending_closes_by_symbol: dict[str, asyncio.Task[None]] = {}
         self.last_closed_by_symbol: dict[str, datetime] = {}
 
         self.closed_trades_count = 0
@@ -228,11 +246,13 @@ class MeanReversionEngine:
 
     async def shutdown(self) -> None:
         tasks = [pending.task for pending in self.pending_entries_by_symbol.values()]
+        tasks.extend(self.pending_closes_by_symbol.values())
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self.pending_entries_by_symbol.clear()
+        self.pending_closes_by_symbol.clear()
         self.log_summary()
 
     async def summary_loop(self, stop_event: asyncio.Event) -> None:
@@ -372,11 +392,18 @@ class MeanReversionEngine:
         tracking_fresh_max_age_ms = min(exit_max_age_ms, 5_000)
 
         for symbol, position in list(self.open_positions_by_symbol.items()):
+            if symbol in self.pending_closes_by_symbol:
+                continue
             long_quote = latest_quotes.get((position.long_exchange, symbol))
             short_quote = latest_quotes.get((position.short_exchange, symbol))
 
             if long_quote is None or short_quote is None:
-                self._close_position(position=position, close_reason="stale_quote", long_quote=None, short_quote=None)
+                self._schedule_close(
+                    position=position,
+                    close_reason="stale_quote",
+                    long_quote=None,
+                    short_quote=None,
+                )
                 continue
 
             age_long_ms = (now - long_quote.received_at).total_seconds() * 1000.0
@@ -432,12 +459,44 @@ class MeanReversionEngine:
                     )
 
             if close_reason is not None:
-                self._close_position(
+                self._schedule_close(
                     position=position,
                     close_reason=close_reason,
                     long_quote=long_quote,
                     short_quote=short_quote,
                 )
+
+    def _schedule_close(
+        self,
+        *,
+        position: MeanRevPosition,
+        close_reason: str,
+        long_quote: Quote | None,
+        short_quote: Quote | None,
+    ) -> None:
+        symbol = position.symbol
+        if symbol in self.pending_closes_by_symbol:
+            return
+        task = asyncio.create_task(
+            self._close_position(
+                position=position,
+                close_reason=close_reason,
+                long_quote=long_quote,
+                short_quote=short_quote,
+            ),
+            name=f"mr-close-{symbol}",
+        )
+        self.pending_closes_by_symbol[symbol] = task
+
+        def _finalize(done_task: asyncio.Task[None], *, tracked_symbol: str = symbol) -> None:
+            self.pending_closes_by_symbol.pop(tracked_symbol, None)
+            if done_task.cancelled():
+                return
+            exc = done_task.exception()
+            if exc is not None:
+                self.log.error("close task failed | %s | %s", tracked_symbol, exc)
+
+        task.add_done_callback(_finalize)
 
     def _update_baseline(
         self,
@@ -483,6 +542,12 @@ class MeanReversionEngine:
         excluded = set(self.settings.mr_excluded_exchanges)
         if long_exchange.value in excluded or short_exchange.value in excluded:
             return
+        if self.live_mode and self.execution_service is not None:
+            if (
+                long_exchange not in self.execution_service.clients
+                or short_exchange not in self.execution_service.clients
+            ):
+                return
 
         # Quote freshness filter: reject pairs where quotes are unreliable
         if self._freshness_ready(long_exchange, symbol) and self._freshness_ready(short_exchange, symbol):
@@ -549,7 +614,10 @@ class MeanReversionEngine:
 
         long_capacity = float(long_quote.best_ask_price * long_quote.best_ask_size)
         short_capacity = float(short_quote.best_bid_price * short_quote.best_bid_size)
-        if long_capacity < self.settings.mr_notional_usdt or short_capacity < self.settings.mr_notional_usdt:
+        required_signal_notional = self.settings.mr_notional_usdt
+        if self.live_mode and self.settings.mr_compound_enabled:
+            required_signal_notional = self.settings.mr_min_notional_usdt
+        if long_capacity < required_signal_notional or short_capacity < required_signal_notional:
             return
 
         planned_at = now + timedelta(milliseconds=self.settings.simulated_execution_delay_ms)
@@ -602,9 +670,22 @@ class MeanReversionEngine:
             if age_long_ms > self.settings.max_quote_age_ms or age_short_ms > self.settings.max_quote_age_ms:
                 return
 
+            if self.live_mode:
+                if self.execution_service is None:
+                    return
+                notional = await self.execution_service.calculate_notional(
+                    long_exchange=current.long_exchange,
+                    short_exchange=current.short_exchange,
+                )
+                if notional <= 0:
+                    self.log.info("mr skip | %s | insufficient balance for compound notional", symbol)
+                    return
+            else:
+                notional = self.settings.mr_notional_usdt
+
             long_capacity = float(long_quote.best_ask_price * long_quote.best_ask_size)
             short_capacity = float(short_quote.best_bid_price * short_quote.best_bid_size)
-            if long_capacity < self.settings.mr_notional_usdt or short_capacity < self.settings.mr_notional_usdt:
+            if long_capacity < notional or short_capacity < notional:
                 return
 
             current_spread_pct = _directional_spread_pct(
@@ -626,12 +707,12 @@ class MeanReversionEngine:
                 return
 
             entry_fees_usdt = _one_side_fees_usdt(
-                notional_usdt=self.settings.mr_notional_usdt,
+                notional_usdt=notional,
                 fee_long_pct=self._get_fee_pct(current.long_exchange),
                 fee_short_pct=self._get_fee_pct(current.short_exchange),
             )
             entry_slippage_usdt = _one_side_slippage_usdt(
-                notional_usdt=self.settings.mr_notional_usdt,
+                notional_usdt=notional,
                 slippage_buffer_pct=self.settings.slippage_buffer_pct,
             )
 
@@ -642,15 +723,54 @@ class MeanReversionEngine:
             )
             edge_at_entry = current_spread_pct - current.rolling_mean
             take_profit_target = current_spread_pct - (edge_at_entry * self.settings.mr_take_profit_fraction)
+            long_stop_id = ""
+            short_stop_id = ""
+
+            if self.live_mode:
+                try:
+                    if self.execution_service is None:
+                        return
+                    spread_result = await self.execution_service.execute_spread_entry(
+                        symbol=symbol,
+                        long_exchange=current.long_exchange,
+                        short_exchange=current.short_exchange,
+                        notional_usdt=notional,
+                        long_quote=long_quote,
+                        short_quote=short_quote,
+                    )
+                    entry_long_price = float(spread_result.long_order.avg_price)
+                    entry_short_price = float(spread_result.short_order.avg_price)
+                    actual_entry_fees = float(spread_result.long_order.fee + spread_result.short_order.fee)
+                    actual_qty_long = spread_result.long_order.filled_qty
+                    actual_qty_short = spread_result.short_order.filled_qty
+                    long_stop_id, short_stop_id = await self.execution_service.place_protective_stops(
+                        symbol=symbol,
+                        long_exchange=current.long_exchange,
+                        short_exchange=current.short_exchange,
+                        long_qty=actual_qty_long,
+                        short_qty=actual_qty_short,
+                        long_entry_price=spread_result.long_order.avg_price,
+                        short_entry_price=spread_result.short_order.avg_price,
+                    )
+                except Exception as exc:
+                    self.log.error("LIVE entry failed | %s | %s", symbol, exc)
+                    return
+            else:
+                entry_long_price = float(long_quote.best_ask_price)
+                entry_short_price = float(short_quote.best_bid_price)
+                actual_entry_fees = entry_fees_usdt
+                actual_qty_long = None
+                actual_qty_short = None
+
             position = MeanRevPosition(
                 symbol=symbol,
                 long_exchange=current.long_exchange,
                 short_exchange=current.short_exchange,
                 direction=current.direction,
-                notional_usdt=self.settings.mr_notional_usdt,
+                notional_usdt=notional,
                 opened_at=now,
-                entry_long_price=float(long_quote.best_ask_price),
-                entry_short_price=float(short_quote.best_bid_price),
+                entry_long_price=entry_long_price,
+                entry_short_price=entry_short_price,
                 entry_spread_pct=current_spread_pct,
                 entry_rolling_mean=current.rolling_mean,
                 entry_rolling_std=current.rolling_std,
@@ -658,18 +778,23 @@ class MeanReversionEngine:
                 take_profit_target=take_profit_target,
                 max_adverse_spread_pct=current_spread_pct,
                 max_favorable_spread_pct=current_spread_pct,
-                estimated_entry_fees_usdt=entry_fees_usdt,
+                estimated_entry_fees_usdt=actual_entry_fees,
                 estimated_entry_slippage_usdt=entry_slippage_usdt,
+                actual_qty_long=actual_qty_long,
+                actual_qty_short=actual_qty_short,
+                long_stop_order_id=long_stop_id,
+                short_stop_order_id=short_stop_id,
             )
             self.open_positions_by_symbol[symbol] = position
 
             self.log.info(
-                "mr open | %s | long=%s @ %.6f | short=%s @ %.6f | spread=%+.4f%% | mean=%+.4f%% | sigma=%.2f | target=%+.4f%%",
+                "mr open | %s | long=%s @ %.6f | short=%s @ %.6f | notional=$%.2f | spread=%+.4f%% | mean=%+.4f%% | sigma=%.2f | target=%+.4f%%",
                 symbol,
                 position.long_exchange.value,
                 position.entry_long_price,
                 position.short_exchange.value,
                 position.entry_short_price,
+                position.notional_usdt,
                 position.entry_spread_pct,
                 position.entry_rolling_mean,
                 position.sigma_at_entry,
@@ -680,7 +805,7 @@ class MeanReversionEngine:
         finally:
             self.pending_entries_by_symbol.pop(symbol, None)
 
-    def _close_position(
+    async def _close_position(
         self,
         *,
         position: MeanRevPosition,
@@ -689,28 +814,109 @@ class MeanReversionEngine:
         short_quote: Quote | None,
     ) -> None:
         now = datetime.now(UTC)
+        if self.live_mode:
+            if self.execution_service is None:
+                self.log.critical("LIVE exit failed | %s | missing execution service", position.symbol)
+                return
+            if position.actual_qty_long is None or position.actual_qty_short is None:
+                self.log.critical("LIVE exit failed | %s | missing filled quantities", position.symbol)
+                return
 
-        if long_quote is None or short_quote is None:
-            exit_long_price = position.entry_long_price
-            exit_short_price = position.entry_short_price
-            exit_spread_pct = position.entry_spread_pct
-        else:
-            exit_long_price = float(long_quote.best_bid_price)
-            exit_short_price = float(short_quote.best_ask_price)
-            exit_spread_pct = _directional_spread_pct(
-                ask_long=long_quote.best_ask_price,
-                bid_short=short_quote.best_bid_price,
+            await self.execution_service.cancel_protective_stops(
+                symbol=position.symbol,
+                long_exchange=position.long_exchange,
+                short_exchange=position.short_exchange,
+                long_stop_id=position.long_stop_order_id,
+                short_stop_id=position.short_stop_order_id,
             )
 
-        exit_fees_usdt = _one_side_fees_usdt(
-            notional_usdt=position.notional_usdt,
-            fee_long_pct=self._get_fee_pct(position.long_exchange),
-            fee_short_pct=self._get_fee_pct(position.short_exchange),
-        )
-        exit_slippage_usdt = _one_side_slippage_usdt(
-            notional_usdt=position.notional_usdt,
-            slippage_buffer_pct=self.settings.slippage_buffer_pct,
-        )
+            try:
+                spread_result = await self.execution_service.execute_spread_exit(
+                    symbol=position.symbol,
+                    long_exchange=position.long_exchange,
+                    short_exchange=position.short_exchange,
+                    long_qty=position.actual_qty_long,
+                    short_qty=position.actual_qty_short,
+                )
+                exit_long_price = float(spread_result.long_order.avg_price)
+                exit_short_price = float(spread_result.short_order.avg_price)
+                actual_exit_fees = float(spread_result.long_order.fee + spread_result.short_order.fee)
+                if long_quote is None or short_quote is None:
+                    exit_spread_pct = position.entry_spread_pct
+                else:
+                    exit_spread_pct = _directional_spread_pct(
+                        ask_long=long_quote.best_ask_price,
+                        bid_short=short_quote.best_bid_price,
+                    )
+                exit_fees_usdt = actual_exit_fees
+                exit_slippage_usdt = 0.0
+            except ExecutionError as exc:
+                self.log.warning(
+                    "exit order failed, checking if position closed by exchange stop | %s | %s",
+                    position.symbol,
+                    exc,
+                )
+                try:
+                    long_pos = await self.execution_service.clients[position.long_exchange].get_position(position.symbol)
+                    short_pos = await self.execution_service.clients[position.short_exchange].get_position(position.symbol)
+                    if float(long_pos.size) == 0.0 and float(short_pos.size) == 0.0:
+                        self.log.info("position already closed (exchange stop triggered) | %s", position.symbol)
+                        if long_quote is None or short_quote is None:
+                            exit_long_price = position.entry_long_price
+                            exit_short_price = position.entry_short_price
+                            exit_spread_pct = position.entry_spread_pct
+                        else:
+                            exit_long_price = float(long_quote.best_bid_price)
+                            exit_short_price = float(short_quote.best_ask_price)
+                            exit_spread_pct = _directional_spread_pct(
+                                ask_long=long_quote.best_ask_price,
+                                bid_short=short_quote.best_bid_price,
+                            )
+                        exit_fees_usdt = _one_side_fees_usdt(
+                            notional_usdt=position.notional_usdt,
+                            fee_long_pct=self._get_fee_pct(position.long_exchange),
+                            fee_short_pct=self._get_fee_pct(position.short_exchange),
+                        )
+                        exit_slippage_usdt = _one_side_slippage_usdt(
+                            notional_usdt=position.notional_usdt,
+                            slippage_buffer_pct=self.settings.slippage_buffer_pct,
+                        )
+                    else:
+                        self.log.critical(
+                            "EXIT FAILED and position still open | %s | MANUAL INTERVENTION",
+                            position.symbol,
+                        )
+                        return
+                except Exception:
+                    self.log.critical(
+                        "EXIT FAILED, could not verify position state | %s | MANUAL INTERVENTION",
+                        position.symbol,
+                    )
+                    return
+            except Exception as exc:
+                self.log.critical("LIVE exit failed | %s | %s - POSITION STILL OPEN", position.symbol, exc)
+                return
+        else:
+            if long_quote is None or short_quote is None:
+                exit_long_price = position.entry_long_price
+                exit_short_price = position.entry_short_price
+                exit_spread_pct = position.entry_spread_pct
+            else:
+                exit_long_price = float(long_quote.best_bid_price)
+                exit_short_price = float(short_quote.best_ask_price)
+                exit_spread_pct = _directional_spread_pct(
+                    ask_long=long_quote.best_ask_price,
+                    bid_short=short_quote.best_bid_price,
+                )
+            exit_fees_usdt = _one_side_fees_usdt(
+                notional_usdt=position.notional_usdt,
+                fee_long_pct=self._get_fee_pct(position.long_exchange),
+                fee_short_pct=self._get_fee_pct(position.short_exchange),
+            )
+            exit_slippage_usdt = _one_side_slippage_usdt(
+                notional_usdt=position.notional_usdt,
+                slippage_buffer_pct=self.settings.slippage_buffer_pct,
+            )
 
         pnl = calculate_pnl(
             notional_usdt=position.notional_usdt,

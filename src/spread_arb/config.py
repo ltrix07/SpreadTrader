@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     mr_min_net_edge_pct: float = Field(default=0.40, ge=0)
     mr_max_positions: int = Field(default=1, ge=1)
     mr_notional_usdt: float = Field(default=350.0, gt=0)
+    mr_compound_enabled: bool = True
+    mr_notional_pct: float = Field(default=85.0, gt=0, le=100)
+    mr_min_notional_usdt: float = Field(default=5.0, ge=1)
     mr_max_hold_seconds: int = Field(default=900, ge=1)
     mr_cooldown_sec: int = Field(default=30, ge=0)
     mr_exit_max_quote_age_ms: int = Field(default=30_000, ge=1)
@@ -88,6 +91,28 @@ class Settings(BaseSettings):
     reconnect_backoff_sec: float = Field(default=2.0, gt=0)
     top_spreads_log_interval_sec: float = Field(default=5.0, gt=0)
     spread_scan_interval_sec: float = Field(default=0.5, gt=0)
+
+    # Live trading
+    live_trading: bool = False
+    default_leverage: int = Field(default=3, ge=1, le=125)
+    order_timeout_sec: float = Field(default=10.0, gt=0)
+    max_notional_usdt: float = Field(default=50.0, ge=0)
+    balance_snapshot_interval_sec: int = Field(default=1800, ge=60)
+    exchange_stop_loss_pct: float = Field(default=5.0, gt=0, le=50)
+
+    # API credentials
+    api_key_binance: str = ""
+    api_secret_binance: str = ""
+    api_key_okx: str = ""
+    api_secret_okx: str = ""
+    api_passphrase_okx: str = ""
+    api_key_bybit: str = ""
+    api_secret_bybit: str = ""
+    api_key_bitget: str = ""
+    api_secret_bitget: str = ""
+    api_passphrase_bitget: str = ""
+    api_key_mexc: str = ""
+    api_secret_mexc: str = ""
 
     @staticmethod
     def _parse_list_env(value: Any) -> list[str] | Any:

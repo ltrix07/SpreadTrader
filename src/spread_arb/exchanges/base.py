@@ -4,10 +4,11 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Sequence
+from decimal import Decimal
 
 from aiohttp import ClientSession
 
-from ..models import ExchangeName, Quote, Symbol
+from ..models import BalanceInfo, ExchangeName, OrderResult, PositionInfo, Quote, Symbol
 
 QuoteCallback = Callable[[Quote], Awaitable[None] | None]
 
@@ -18,9 +19,18 @@ class ExchangeClient(ABC):
     # Override in subclasses with stricter rate limits (e.g. MEXC).
     inter_request_delay_sec: float = 0.0
 
-    def __init__(self, session: ClientSession, request_timeout_sec: float = 8.0) -> None:
+    def __init__(
+        self,
+        session: ClientSession,
+        request_timeout_sec: float = 8.0,
+        api_key: str = "",
+        api_secret: str = "",
+        **_: object,
+    ) -> None:
         self.session = session
         self.request_timeout_sec = request_timeout_sec
+        self.api_key = api_key
+        self.api_secret = api_secret
         self.log = logging.getLogger(f"{__name__}.{self.name.value}")
 
     @property
@@ -31,6 +41,42 @@ class ExchangeClient(ABC):
     @abstractmethod
     async def fetch_quote(self, symbol: Symbol) -> Quote:
         raise NotImplementedError
+
+    async def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: Decimal,
+        close: bool = False,
+    ) -> OrderResult:
+        """Place a market order. Override in subclass for live trading."""
+        raise NotImplementedError(f"{self.name.value} does not support order placement")
+
+    async def place_stop_market_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: Decimal,
+        stop_price: Decimal,
+    ) -> str:
+        """Place a stop-market order. Returns order_id. Override in subclass."""
+        raise NotImplementedError(f"{self.name.value} does not support stop orders")
+
+    async def cancel_order(self, symbol: str, order_id: str) -> None:
+        """Cancel an open order. Override in subclass."""
+        raise NotImplementedError(f"{self.name.value} does not support order cancellation")
+
+    async def get_position(self, symbol: str) -> PositionInfo:
+        raise NotImplementedError(f"{self.name.value} does not support position queries")
+
+    async def set_leverage(self, symbol: str, leverage: int) -> None:
+        raise NotImplementedError(f"{self.name.value} does not support leverage setting")
+
+    async def get_balance(self) -> BalanceInfo:
+        raise NotImplementedError(f"{self.name.value} does not support balance queries")
+
+    async def get_min_order_qty(self, symbol: str) -> Decimal:
+        raise NotImplementedError(f"{self.name.value} does not support min qty queries")
 
     async def poll(
         self,
@@ -77,4 +123,3 @@ class ExchangeClient(ABC):
                     await asyncio.wait_for(stop_event.wait(), timeout=reconnect_backoff_sec)
                 except TimeoutError:
                     continue
-

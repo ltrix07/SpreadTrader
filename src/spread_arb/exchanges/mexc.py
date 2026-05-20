@@ -2,15 +2,34 @@ from __future__ import annotations
 
 import time
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
+from urllib.parse import urlencode
 
-from ..models import ExchangeName, Quote, Symbol
+from ..models import BalanceInfo, ExchangeName, OrderResult, PositionInfo, Quote, Symbol
 from .base import ExchangeClient
+from .signing import hmac_sha256_hex, timestamp_ms
 
 
 class MexcExchange(ExchangeClient):
     base_url = "https://contract.mexc.com"
     inter_request_delay_sec = 0.12  # ~120ms between requests to stay under MEXC rate limit.
+
+    def __init__(
+        self,
+        session,
+        request_timeout_sec: float = 8.0,
+        api_key: str = "",
+        api_secret: str = "",
+        **kwargs: object,
+    ) -> None:
+        super().__init__(
+            session=session,
+            request_timeout_sec=request_timeout_sec,
+            api_key=api_key,
+            api_secret=api_secret,
+            **kwargs,
+        )
+        self._contract_cache: dict[str, dict] = {}
 
     @property
     def name(self) -> ExchangeName:
@@ -62,3 +81,248 @@ class MexcExchange(ExchangeClient):
             source_latency_ms=source_latency_ms,
         )
 
+    async def _signed_request(self, method: str, path: str, params: dict | None = None) -> dict:
+        ts = str(timestamp_ms())
+        req_params = dict(params or {})
+        req_params["timestamp"] = ts
+        query = urlencode(sorted(req_params.items()))
+        signature = hmac_sha256_hex(self.api_secret, query)
+
+        url = f"{self.base_url}{path}"
+        headers = {
+            "ApiKey": self.api_key,
+            "Request-Time": ts,
+            "Signature": signature,
+            "Content-Type": "application/json",
+        }
+        method_upper = method.upper()
+
+        if method_upper == "GET":
+            full_url = f"{url}?{query}&Signature={signature}"
+            async with self.session.get(full_url, headers=headers, timeout=self.request_timeout_sec) as response:
+                data = await response.json()
+        else:
+            req_params["Signature"] = signature
+            async with self.session.post(
+                url,
+                headers=headers,
+                json=req_params,
+                timeout=self.request_timeout_sec,
+            ) as response:
+                data = await response.json()
+
+        if not data.get("success", True):
+            raise RuntimeError(f"MEXC API error: {data}")
+        if data.get("code") not in (None, 0):
+            raise RuntimeError(f"MEXC API error: {data}")
+        return data.get("data", data)
+
+    async def _contract_detail(self, symbol: str) -> dict:
+        mexc_symbol = self._to_mexc_symbol(symbol)
+        cached = self._contract_cache.get(mexc_symbol)
+        if cached is not None:
+            return cached
+
+        url = f"{self.base_url}/api/v1/contract/detail"
+        async with self.session.get(url, params={"symbol": mexc_symbol}, timeout=self.request_timeout_sec) as response:
+            data = await response.json()
+            if not data.get("success", True):
+                raise RuntimeError(f"MEXC contract detail error: {data}")
+            details = data.get("data") or []
+            if isinstance(details, dict):
+                detail = details
+            else:
+                detail = next((item for item in details if item.get("symbol") == mexc_symbol), None)
+            if detail is None:
+                raise RuntimeError(f"MEXC contract metadata not found for {symbol}")
+            self._contract_cache[mexc_symbol] = detail
+            return detail
+
+    async def _base_qty_to_contracts(self, symbol: str, qty: Decimal) -> int:
+        detail = await self._contract_detail(symbol)
+        contract_size = Decimal(str(detail.get("contractSize", "1")))
+        contracts = (qty / contract_size).to_integral_value(rounding=ROUND_DOWN)
+        return int(contracts)
+
+    async def _contracts_to_base_qty(self, symbol: str, contracts: Decimal) -> Decimal:
+        detail = await self._contract_detail(symbol)
+        contract_size = Decimal(str(detail.get("contractSize", "1")))
+        return contracts * contract_size
+
+    async def _mexc_order_side(self, symbol: str, side: str, close: bool = False) -> int:
+        # MEXC side:
+        # 1=open long, 2=close short, 3=open short, 4=close long.
+        # Prefer explicit close intent; fallback to position inference.
+        side_lower = side.lower()
+        if close:
+            if side_lower == "buy":
+                return 2
+            if side_lower == "sell":
+                return 4
+            raise ValueError(f"Unsupported side: {side}")
+
+        position = await self.get_position(symbol)
+        if side_lower == "buy":
+            return 2 if position.size < 0 else 1
+        if side_lower == "sell":
+            return 4 if position.size > 0 else 3
+        raise ValueError(f"Unsupported side: {side}")
+
+    async def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: Decimal,
+        close: bool = False,
+    ) -> OrderResult:
+        mexc_symbol = self._to_mexc_symbol(symbol)
+        contracts = await self._base_qty_to_contracts(symbol, qty)
+        if contracts <= 0:
+            raise RuntimeError(f"Computed contract volume is zero for {symbol}, qty={qty}")
+
+        mexc_side = await self._mexc_order_side(symbol, side, close=close)
+        data = await self._signed_request(
+            "POST",
+            "/api/v1/private/order/submit",
+            {
+                "symbol": mexc_symbol,
+                "side": mexc_side,
+                "type": 5,
+                "vol": contracts,
+                "openType": 2,
+            },
+        )
+        order_id = str(data.get("orderId", ""))
+        detail = {}
+        if order_id:
+            try:
+                detail = await self._signed_request("GET", f"/api/v1/private/order/get/{order_id}")
+            except Exception:
+                detail = {}
+
+        filled_contracts = Decimal(
+            str(
+                detail.get("dealVol")
+                or detail.get("vol")
+                or contracts
+            )
+        )
+        avg_price = Decimal(str(detail.get("avgPrice") or detail.get("price") or "0"))
+        fee = Decimal(str(detail.get("fee") or detail.get("takerFee") or "0")).copy_abs()
+        update_time = detail.get("updateTime") or detail.get("createTime") or timestamp_ms()
+        status = str(detail.get("state") or detail.get("status") or "")
+        filled_qty = await self._contracts_to_base_qty(symbol, filled_contracts)
+        return OrderResult(
+            exchange=self.name,
+            symbol=symbol,
+            side=side.lower(),
+            filled_qty=filled_qty,
+            avg_price=avg_price,
+            fee=fee,
+            fee_currency="USDT",
+            order_id=order_id,
+            timestamp=datetime.fromtimestamp(int(update_time) / 1000, tz=UTC),
+            is_partial=status not in {"4", "5", "filled", "FILLED"},
+            raw_response=detail or data,
+        )
+
+    async def place_stop_market_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: Decimal,
+        stop_price: Decimal,
+    ) -> str:
+        mexc_symbol = self._to_mexc_symbol(symbol)
+        contracts = await self._base_qty_to_contracts(symbol, qty)
+        if contracts <= 0:
+            raise RuntimeError(f"Computed contract volume is zero for stop order: {symbol}, qty={qty}")
+
+        side_lower = side.lower()
+        mexc_side = 4 if side_lower == "sell" else 2
+        data = await self._signed_request(
+            "POST",
+            "/api/v1/private/planorder/place",
+            {
+                "symbol": mexc_symbol,
+                "side": mexc_side,
+                "type": 5,
+                "triggerPrice": str(stop_price),
+                "triggerType": 1,
+                "vol": contracts,
+                "openType": 2,
+            },
+        )
+        order_id = data.get("orderId") or data.get("id") or data.get("data")
+        return str(order_id or "")
+
+    async def cancel_order(self, symbol: str, order_id: str) -> None:
+        mexc_symbol = self._to_mexc_symbol(symbol)
+        await self._signed_request(
+            "POST",
+            "/api/v1/private/planorder/cancel",
+            {
+                "symbol": mexc_symbol,
+                "orderId": order_id,
+            },
+        )
+
+    async def set_leverage(self, symbol: str, leverage: int) -> None:
+        mexc_symbol = self._to_mexc_symbol(symbol)
+        await self._signed_request(
+            "POST",
+            "/api/v1/private/position/change_leverage",
+            {"symbol": mexc_symbol, "leverage": leverage, "openType": 2},
+        )
+
+    async def get_balance(self) -> BalanceInfo:
+        data = await self._signed_request("GET", "/api/v1/private/account/assets")
+        assets = data if isinstance(data, list) else data.get("assets", [])
+        for item in assets:
+            if item.get("currency") == "USDT":
+                total = item.get("balance") or item.get("equity") or "0"
+                available = item.get("availableBalance") or item.get("available") or "0"
+                return BalanceInfo(
+                    exchange=self.name,
+                    total_usdt=Decimal(str(total)),
+                    available_usdt=Decimal(str(available)),
+                )
+        raise RuntimeError("USDT balance not found")
+
+    async def get_position(self, symbol: str) -> PositionInfo:
+        mexc_symbol = self._to_mexc_symbol(symbol)
+        data = await self._signed_request(
+            "GET",
+            "/api/v1/private/position/open_positions",
+            {"symbol": mexc_symbol},
+        )
+        positions = data if isinstance(data, list) else data.get("rows") or data.get("list") or []
+        if not positions:
+            return PositionInfo(
+                exchange=self.name,
+                symbol=symbol,
+                size=Decimal("0"),
+                entry_price=Decimal("0"),
+                unrealized_pnl=Decimal("0"),
+                leverage=1,
+            )
+
+        pos = positions[0]
+        vol = Decimal(str(pos.get("holdVol") or pos.get("positionVol") or pos.get("vol") or "0"))
+        side = int(pos.get("positionType") or pos.get("positionSide") or 1)
+        size = await self._contracts_to_base_qty(symbol, vol)
+        if side in (2, 3, 4):
+            size = -size
+        return PositionInfo(
+            exchange=self.name,
+            symbol=symbol,
+            size=size,
+            entry_price=Decimal(str(pos.get("openAvgPrice") or pos.get("openPrice") or "0")),
+            unrealized_pnl=Decimal(str(pos.get("unrealizedPnl") or pos.get("unrealisedPnl") or "0")),
+            leverage=int(Decimal(str(pos.get("leverage") or "1"))),
+        )
+
+    async def get_min_order_qty(self, symbol: str) -> Decimal:
+        detail = await self._contract_detail(symbol)
+        min_vol = Decimal(str(detail.get("minVol", "1")))
+        return await self._contracts_to_base_qty(symbol, min_vol)

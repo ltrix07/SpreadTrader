@@ -12,6 +12,7 @@ from itertools import combinations
 import aiohttp
 
 from .config import Settings
+from .execution import ExecutionService
 from .exchanges import (
     BinanceExchange,
     BitgetExchange,
@@ -52,6 +53,7 @@ class QuoteScanner:
         self.total_scans: int = 0
         self.opportunity_store: OpportunityStore | None = None
         self.mean_reversion_engine: MeanReversionEngine | None = None
+        self.live_clients: dict[ExchangeName, ExchangeClient] = {}
 
         self.exchange_fees_pct: dict[ExchangeName, float] = {
             ExchangeName.MEXC: self.settings.taker_fee_mexc_pct,
@@ -68,20 +70,52 @@ class QuoteScanner:
 
         timeout = aiohttp.ClientTimeout(total=self.settings.request_timeout_sec)
         with OpportunityStore(self.settings.database_url) as self.opportunity_store:
-            self.mean_reversion_engine = None
-            if self.settings.mr_enabled:
-                self.mean_reversion_engine = MeanReversionEngine(
-                    settings=self.settings,
-                    opportunity_store=self.opportunity_store,
-                    get_latest_quote=self._get_latest_quote,
-                )
-                self.mean_reversion_engine.preload_baselines(self.settings.database_url)
             async with aiohttp.ClientSession(timeout=timeout) as session:
+                cred_map: dict[ExchangeName, dict[str, str]] = {}
+                if self.settings.live_trading:
+                    cred_map = self._build_live_credential_map()
+                    self._validate_live_credentials(cred_map)
+
+                exchanges = self._build_exchanges(
+                    session,
+                    credential_map=cred_map if self.settings.live_trading else None,
+                )
+                self.live_clients = {}
+                execution_service: ExecutionService | None = None
+                if self.settings.live_trading:
+                    self.live_clients = {
+                        exchange.name: exchange
+                        for exchange in exchanges
+                        if exchange.name in {
+                            ExchangeName.BINANCE,
+                            ExchangeName.OKX,
+                            ExchangeName.BYBIT,
+                            ExchangeName.BITGET,
+                            ExchangeName.MEXC,
+                        }
+                    }
+                    execution_service = ExecutionService(
+                        settings=self.settings,
+                        clients=self.live_clients,
+                    )
+                    await execution_service.initialize(self.settings.symbols)
+                    await self._capture_startup_balances()
+
+                self.mean_reversion_engine = None
+                if self.settings.mr_enabled:
+                    self.mean_reversion_engine = MeanReversionEngine(
+                        settings=self.settings,
+                        opportunity_store=self.opportunity_store,
+                        get_latest_quote=self._get_latest_quote,
+                        execution_service=execution_service,
+                    )
+                    self.mean_reversion_engine.preload_baselines(self.settings.database_url)
+
                 if self.settings.use_websocket:
                     data_tasks = self._start_ws_feeds(session)
                     mode = "websocket"
                 else:
-                    data_tasks = self._start_rest_polls(session)
+                    data_tasks = self._start_rest_polls(exchanges)
                     mode = "REST"
 
                 if not data_tasks:
@@ -97,6 +131,12 @@ class QuoteScanner:
                 stale_task = asyncio.create_task(self._monitor_stale_quotes(), name="stale-monitor")
                 spread_task = asyncio.create_task(self._log_top_spreads(), name="spread-monitor")
                 quote_health_task = asyncio.create_task(self._log_quote_health(), name="quote-health")
+                balance_snapshot_task: asyncio.Task | None = None
+                if self.settings.live_trading and self.live_clients:
+                    balance_snapshot_task = asyncio.create_task(
+                        self._snapshot_balances(),
+                        name="balance-snapshots",
+                    )
                 mr_summary_task: asyncio.Task | None = None
                 if self.mean_reversion_engine is not None:
                     mr_summary_task = asyncio.create_task(
@@ -124,6 +164,8 @@ class QuoteScanner:
                 ]
                 if mr_summary_task is not None:
                     bg_tasks.append(mr_summary_task)
+                if balance_snapshot_task is not None:
+                    bg_tasks.append(balance_snapshot_task)
                 for task in bg_tasks:
                     task.cancel()
 
@@ -133,6 +175,7 @@ class QuoteScanner:
                 self.log.info("scanner stopped")
         self.opportunity_store = None
         self.mean_reversion_engine = None
+        self.live_clients = {}
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -538,6 +581,60 @@ class QuoteScanner:
                     exc_info=True,
                 )
 
+    async def _capture_startup_balances(self) -> None:
+        if self.opportunity_store is None:
+            return
+        for exchange_name, client in self.live_clients.items():
+            try:
+                balance = await client.get_balance()
+                self.log.info(
+                    "startup balance | %s | total=%.2f available=%.2f",
+                    exchange_name.value,
+                    balance.total_usdt,
+                    balance.available_usdt,
+                )
+                await self.opportunity_store.save_balance_snapshot(
+                    exchange=exchange_name.value,
+                    total_usdt=float(balance.total_usdt),
+                    available_usdt=float(balance.available_usdt),
+                    snapshot_type="startup",
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning(
+                    "failed to get startup balance for %s: %s",
+                    exchange_name.value,
+                    exc,
+                )
+
+    async def _snapshot_balances(self) -> None:
+        """Periodically snapshot balances on all active exchanges."""
+        interval_sec = self.settings.balance_snapshot_interval_sec
+        while not self.stop_event.is_set():
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=interval_sec)
+                return
+            except TimeoutError:
+                pass
+
+            if self.opportunity_store is None:
+                continue
+
+            for exchange_name, client in self.live_clients.items():
+                try:
+                    balance = await client.get_balance()
+                    await self.opportunity_store.save_balance_snapshot(
+                        exchange=exchange_name.value,
+                        total_usdt=float(balance.total_usdt),
+                        available_usdt=float(balance.available_usdt),
+                        snapshot_type="periodic",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.log.warning(
+                        "balance snapshot failed for %s: %s",
+                        exchange_name.value,
+                        exc,
+                    )
+
     def _start_ws_feeds(self, session: aiohttp.ClientSession) -> list[asyncio.Task]:
         """Create WebSocket feed tasks for all configured exchanges."""
         ws_factory: dict[ExchangeName, type[WebSocketFeed]] = {
@@ -568,9 +665,8 @@ class QuoteScanner:
             )
         return tasks
 
-    def _start_rest_polls(self, session: aiohttp.ClientSession) -> list[asyncio.Task]:
+    def _start_rest_polls(self, exchanges: list[ExchangeClient]) -> list[asyncio.Task]:
         """Create REST polling tasks for all configured exchanges (legacy mode)."""
-        exchanges = self._build_exchanges(session)
         return [
             asyncio.create_task(
                 exchange.poll(
@@ -585,7 +681,11 @@ class QuoteScanner:
             for exchange in exchanges
         ]
 
-    def _build_exchanges(self, session: aiohttp.ClientSession) -> list[ExchangeClient]:
+    def _build_exchanges(
+        self,
+        session: aiohttp.ClientSession,
+        credential_map: dict[ExchangeName, dict[str, str]] | None = None,
+    ) -> list[ExchangeClient]:
         by_name: dict[ExchangeName, type[ExchangeClient]] = {
             ExchangeName.MEXC: MexcExchange,
             ExchangeName.BYBIT: BybitExchange,
@@ -602,8 +702,53 @@ class QuoteScanner:
             if factory is None:
                 self.log.warning("unknown exchange in config, skipping: %s", exchange_name)
                 continue
-            result.append(factory(session=session, request_timeout_sec=self.settings.request_timeout_sec))
+            kwargs = dict(credential_map.get(exchange_name, {})) if credential_map else {}
+            result.append(
+                factory(
+                    session=session,
+                    request_timeout_sec=self.settings.request_timeout_sec,
+                    **kwargs,
+                )
+            )
         return result
+
+    def _build_live_credential_map(self) -> dict[ExchangeName, dict[str, str]]:
+        settings = self.settings
+        return {
+            ExchangeName.BINANCE: {
+                "api_key": settings.api_key_binance,
+                "api_secret": settings.api_secret_binance,
+            },
+            ExchangeName.OKX: {
+                "api_key": settings.api_key_okx,
+                "api_secret": settings.api_secret_okx,
+                "passphrase": settings.api_passphrase_okx,
+            },
+            ExchangeName.BYBIT: {
+                "api_key": settings.api_key_bybit,
+                "api_secret": settings.api_secret_bybit,
+            },
+            ExchangeName.BITGET: {
+                "api_key": settings.api_key_bitget,
+                "api_secret": settings.api_secret_bitget,
+                "passphrase": settings.api_passphrase_bitget,
+            },
+            ExchangeName.MEXC: {
+                "api_key": settings.api_key_mexc,
+                "api_secret": settings.api_secret_mexc,
+            },
+        }
+
+    def _validate_live_credentials(self, cred_map: dict[ExchangeName, dict[str, str]]) -> None:
+        for exchange_name in self.settings.exchanges:
+            creds = cred_map.get(exchange_name)
+            if creds is None:
+                continue
+            missing = [key for key, value in creds.items() if not str(value).strip()]
+            if missing:
+                raise RuntimeError(
+                    f"live trading requires credentials for {exchange_name.value}: missing {', '.join(missing)}"
+                )
 
     def _install_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()

@@ -197,6 +197,24 @@ def init_sqlite(database_url: str) -> Path:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS balance_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                exchange TEXT NOT NULL,
+                total_usdt REAL NOT NULL,
+                available_usdt REAL NOT NULL,
+                snapshot_type TEXT NOT NULL DEFAULT 'periodic'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_balance_snapshots_ts_exchange
+            ON balance_snapshots (timestamp, exchange)
+            """
+        )
         conn.commit()
 
     return db_path
@@ -426,6 +444,65 @@ class OpportunityStore:
         )
         self.conn.commit()
         return len(records)
+
+    async def save_balance_snapshot(
+        self,
+        exchange: str,
+        total_usdt: float,
+        available_usdt: float,
+        snapshot_type: str = "periodic",
+    ) -> None:
+        """Insert a balance snapshot row."""
+        self.conn.execute(
+            """
+            INSERT INTO balance_snapshots (
+                timestamp,
+                exchange,
+                total_usdt,
+                available_usdt,
+                snapshot_type
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                self.now_iso(),
+                exchange,
+                total_usdt,
+                available_usdt,
+                snapshot_type,
+            ),
+        )
+        self.conn.commit()
+
+    async def get_balance_snapshots(
+        self,
+        since: str | None = None,
+        exchange: str | None = None,
+    ) -> list[dict]:
+        """Retrieve balance snapshots, optionally filtered by time and exchange."""
+        query = """
+            SELECT
+                id,
+                timestamp,
+                exchange,
+                total_usdt,
+                available_usdt,
+                snapshot_type
+            FROM balance_snapshots
+            WHERE 1=1
+        """
+        params: list[str] = []
+        if since is not None:
+            query += " AND timestamp >= ?"
+            params.append(since)
+        if exchange is not None:
+            query += " AND exchange = ?"
+            params.append(exchange)
+        query += " ORDER BY timestamp ASC, id ASC"
+
+        cursor = self.conn.execute(query, params)
+        columns = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        return [dict(zip(columns, row, strict=False)) for row in rows]
 
     @staticmethod
     def now_iso() -> str:

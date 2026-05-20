@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -37,3 +38,49 @@ class Quote(BaseModel):
 
     receive_latency_ms: float = Field(ge=0)
     source_latency_ms: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OrderResult:
+    """Result of a single exchange order execution."""
+
+    exchange: ExchangeName
+    symbol: str
+    side: str
+    filled_qty: Decimal
+    avg_price: Decimal
+    fee: Decimal
+    fee_currency: str
+    order_id: str
+    timestamp: datetime
+    is_partial: bool
+    raw_response: dict
+
+
+@dataclass(frozen=True, slots=True)
+class SpreadOrderResult:
+    """Result of a spread entry or exit (two legs)."""
+
+    long_order: OrderResult
+    short_order: OrderResult
+
+
+@dataclass(frozen=True, slots=True)
+class PositionInfo:
+    """Current position on an exchange."""
+
+    exchange: ExchangeName
+    symbol: str
+    size: Decimal
+    entry_price: Decimal
+    unrealized_pnl: Decimal
+    leverage: int
+
+
+@dataclass(frozen=True, slots=True)
+class BalanceInfo:
+    """USDT balance on an exchange."""
+
+    exchange: ExchangeName
+    total_usdt: Decimal
+    available_usdt: Decimal
