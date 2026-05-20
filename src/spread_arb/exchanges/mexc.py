@@ -292,11 +292,64 @@ class MexcExchange(ExchangeClient):
 
     async def set_leverage(self, symbol: str, leverage: int) -> None:
         mexc_symbol = self._to_mexc_symbol(symbol)
-        await self._signed_request(
-            "POST",
-            "/api/v1/private/position/change_leverage",
-            {"symbol": mexc_symbol, "leverage": leverage, "openType": 2},
+        # Prefer positionId when there is an active position. MEXC validates
+        # change_leverage differently with and without positions.
+        try:
+            raw_positions = await self._signed_request(
+                "GET",
+                "/api/v1/private/position/open_positions",
+                {"symbol": mexc_symbol},
+            )
+        except RuntimeError:
+            raw_positions = []
+
+        positions = (
+            raw_positions
+            if isinstance(raw_positions, list)
+            else raw_positions.get("rows") or raw_positions.get("list") or []
         )
+        active_pos = next(
+            (
+                item
+                for item in positions
+                if Decimal(str(item.get("holdVol") or item.get("positionVol") or item.get("vol") or "0")) > 0
+            ),
+            None,
+        )
+
+        if active_pos:
+            position_id = active_pos.get("positionId") or active_pos.get("id")
+            if position_id is not None:
+                await self._signed_request(
+                    "POST",
+                    "/api/v1/private/position/change_leverage",
+                    {"positionId": int(position_id), "leverage": leverage},
+                )
+                return
+
+        # No active position: docs require symbol + openType + positionType.
+        # Try both position sides and both margin modes because account config
+        # may differ between symbols.
+        attempts = [
+            {"symbol": mexc_symbol, "leverage": leverage, "openType": 2, "positionType": 1},
+            {"symbol": mexc_symbol, "leverage": leverage, "openType": 2, "positionType": 2},
+            {"symbol": mexc_symbol, "leverage": leverage, "openType": 1, "positionType": 1},
+            {"symbol": mexc_symbol, "leverage": leverage, "openType": 1, "positionType": 2},
+        ]
+        last_error: RuntimeError | None = None
+        for payload in attempts:
+            try:
+                await self._signed_request(
+                    "POST",
+                    "/api/v1/private/position/change_leverage",
+                    payload,
+                )
+                return
+            except RuntimeError as exc:
+                last_error = exc
+
+        if last_error is not None:
+            raise last_error
 
     async def get_balance(self) -> BalanceInfo:
         data = await self._signed_request("GET", "/api/v1/private/account/assets")
