@@ -180,14 +180,14 @@ class BitgetExchange(ExchangeClient):
         bitget_symbol = self._to_bitget_symbol(symbol)
         exchange_qty = self._to_exchange_qty(symbol, qty)
         side_lower = side.lower()
-        # One-way mode: no holdSide needed. tradeSide open/close is sufficient.
+        # One-way mode: do NOT send tradeSide at all.
+        # Use reduceOnly="YES" to close instead.
         body: dict[str, str] = {
             "symbol": bitget_symbol,
             "productType": "USDT-FUTURES",
             "marginMode": "crossed",
             "marginCoin": "USDT",
             "side": side_lower,
-            "tradeSide": "close" if close else "open",
             "orderType": "market",
             "size": str(exchange_qty),
         }
@@ -330,7 +330,6 @@ class BitgetExchange(ExchangeClient):
                 "marginMode": "crossed",
                 "marginCoin": "USDT",
                 "side": side_lower,
-                "tradeSide": "close",
                 "orderType": "market",
                 "size": str(exchange_qty),
                 "triggerPrice": str(rounded_stop),
