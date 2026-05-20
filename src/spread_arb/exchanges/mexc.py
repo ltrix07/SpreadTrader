@@ -83,10 +83,25 @@ class MexcExchange(ExchangeClient):
 
     async def _signed_request(self, method: str, path: str, params: dict | None = None) -> dict:
         ts = str(timestamp_ms())
-        req_params = dict(params or {})
-        req_params["timestamp"] = ts
-        query = urlencode(sorted(req_params.items()))
-        signature = hmac_sha256_hex(self.api_secret, query)
+        req_params = {
+            key: value
+            for key, value in dict(params or {}).items()
+            if value is not None
+        }
+        method_upper = method.upper()
+
+        if method_upper in {"GET", "DELETE"}:
+            # MEXC contract signature string for GET/DELETE:
+            # sorted URL-encoded service params joined by '&'.
+            request_param_str = urlencode(sorted(req_params.items()))
+        else:
+            # MEXC contract signature string for POST:
+            # JSON body string as-is (no key sorting required).
+            import json
+            request_param_str = json.dumps(req_params, separators=(",", ":"), ensure_ascii=False)
+
+        sign_payload = f"{self.api_key}{ts}{request_param_str}"
+        signature = hmac_sha256_hex(self.api_secret, sign_payload)
 
         url = f"{self.base_url}{path}"
         headers = {
@@ -95,14 +110,16 @@ class MexcExchange(ExchangeClient):
             "Signature": signature,
             "Content-Type": "application/json",
         }
-        method_upper = method.upper()
 
         if method_upper == "GET":
-            full_url = f"{url}?{query}&Signature={signature}"
+            full_url = f"{url}?{request_param_str}" if request_param_str else url
             async with self.session.get(full_url, headers=headers, timeout=self.request_timeout_sec) as response:
                 data = await response.json()
+        elif method_upper == "DELETE":
+            full_url = f"{url}?{request_param_str}" if request_param_str else url
+            async with self.session.delete(full_url, headers=headers, timeout=self.request_timeout_sec) as response:
+                data = await response.json()
         else:
-            req_params["Signature"] = signature
             async with self.session.post(
                 url,
                 headers=headers,
