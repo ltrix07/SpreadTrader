@@ -179,16 +179,21 @@ class BitgetExchange(ExchangeClient):
     ) -> OrderResult:
         bitget_symbol = self._to_bitget_symbol(symbol)
         exchange_qty = self._to_exchange_qty(symbol, qty)
-        body = {
+        side_lower = side.lower()
+        body: dict[str, str] = {
             "symbol": bitget_symbol,
             "productType": "USDT-FUTURES",
             "marginMode": "crossed",
             "marginCoin": "USDT",
-            "side": side.lower(),
+            "side": side_lower,
             "tradeSide": "close" if close else "open",
             "orderType": "market",
             "size": str(exchange_qty),
         }
+        if close:
+            # Hedge mode: holdSide tells Bitget which position to close.
+            # sell close → closing a long; buy close → closing a short.
+            body["holdSide"] = "long" if side_lower == "sell" else "short"
         data = await self._signed_request("POST", "/api/v2/mix/order/place-order", body)
         order_id = str(data.get("orderId", ""))
 
@@ -314,17 +319,22 @@ class BitgetExchange(ExchangeClient):
         stop_price: Decimal,
     ) -> str:
         bitget_symbol = self._to_bitget_symbol(symbol)
+        side_lower = side.lower()
         exchange_qty = self._to_exchange_qty(symbol, qty)
+        # holdSide: sell stop → closing long, buy stop → closing short.
+        hold_side = "long" if side_lower == "sell" else "short"
         data = await self._signed_request(
             "POST",
             "/api/v2/mix/order/place-plan-order",
             {
+                "planType": "loss_plan",
                 "symbol": bitget_symbol,
                 "productType": "USDT-FUTURES",
                 "marginMode": "crossed",
                 "marginCoin": "USDT",
-                "side": side.lower(),
+                "side": side_lower,
                 "tradeSide": "close",
+                "holdSide": hold_side,
                 "orderType": "market",
                 "size": str(exchange_qty),
                 "triggerPrice": str(stop_price),
