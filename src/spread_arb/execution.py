@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from .config import Settings
 from .exchanges.base import ExchangeClient
@@ -27,6 +27,7 @@ class ExecutionService:
         self.clients = clients
         self.log = logging.getLogger(__name__)
         self._min_qty_cache: dict[tuple[ExchangeName, str], Decimal] = {}
+        self._step_size_cache: dict[tuple[ExchangeName, str], Decimal] = {}
         self._balance_cache: dict[ExchangeName, tuple[float, float]] = {}
         self._balance_cache_ttl: float = 30.0
 
@@ -123,6 +124,10 @@ class ExecutionService:
         short_price = float(short_quote.best_bid_price)
         long_qty = Decimal(str(notional_usdt)) / Decimal(str(long_price))
         short_qty = Decimal(str(notional_usdt)) / Decimal(str(short_price))
+
+        # Round to exchange step size
+        long_qty = await self._round_qty(long_exchange, symbol, long_qty)
+        short_qty = await self._round_qty(short_exchange, symbol, short_qty)
 
         await self._validate_min_qty(long_exchange, symbol, long_qty)
         await self._validate_min_qty(short_exchange, symbol, short_qty)
@@ -302,6 +307,23 @@ class ExecutionService:
                 self.log.debug("cancelled short protective stop | %s | %s", symbol, short_exchange.value)
             except Exception as exc:
                 self.log.warning("failed to cancel short stop | %s | %s | %s", symbol, short_exchange.value, exc)
+
+    async def _round_qty(self, exchange: ExchangeName, symbol: str, qty: Decimal) -> Decimal:
+        """Round qty DOWN to the exchange's step size (lot size)."""
+        cache_key = (exchange, symbol)
+        if cache_key not in self._step_size_cache:
+            try:
+                step = await self.clients[exchange].get_min_order_qty(symbol)
+                self._step_size_cache[cache_key] = step
+            except (NotImplementedError, Exception):
+                # Fallback: round to 3 decimal places
+                self._step_size_cache[cache_key] = Decimal("0.001")
+
+        step = self._step_size_cache[cache_key]
+        if step <= 0:
+            step = Decimal("0.001")
+        # Round down to nearest step
+        return (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
 
     async def _validate_min_qty(self, exchange: ExchangeName, symbol: str, qty: Decimal) -> None:
         cache_key = (exchange, symbol)

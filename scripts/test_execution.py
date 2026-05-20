@@ -124,10 +124,14 @@ async def run_test(exchange_name: str, symbol: str, notional: float, leverage: i
             (ask_price - bid_price) / bid_price * 100,
         )
 
+        from decimal import ROUND_DOWN
         qty = Decimal(str(notional)) / Decimal(str(ask_price))
 
         try:
             min_qty = await client.get_min_order_qty(symbol)
+            # Round qty down to step size
+            if min_qty > 0:
+                qty = (qty / min_qty).to_integral_value(rounding=ROUND_DOWN) * min_qty
             log.info("Min order qty: %s, our qty: %s", min_qty, qty)
             if qty < min_qty:
                 log.error(
