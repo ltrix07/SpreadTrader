@@ -173,7 +173,7 @@ class BinanceExchange(ExchangeClient):
             "symbol": bn_symbol,
             "side": side.upper(),
             "type": "STOP_MARKET",
-            "stopPrice": str(stop_price),
+            "triggerPrice": str(stop_price),
             "quantity": str(self._to_exchange_qty(symbol, qty)),
             "algoType": "CONDITIONAL",
         }

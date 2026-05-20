@@ -241,11 +241,26 @@ class BybitExchange(ExchangeClient):
         if not accounts:
             raise RuntimeError("Bybit balance response missing account list")
 
-        for coin_info in accounts[0].get("coin", []):
+        account = accounts[0]
+        # Account-level available margin (works for both UTA and classic).
+        acct_available = account.get("totalAvailableBalance") or "0"
+
+        for coin_info in account.get("coin", []):
             coin_name = coin_info.get("coin") or coin_info.get("coinName")
             if coin_name == "USDT":
                 total = coin_info.get("walletBalance") or coin_info.get("equity") or "0"
-                available = coin_info.get("availableToWithdraw") or coin_info.get("availableBalance") or "0"
+                # Prefer coin-level availableToOrder; fall back to account-level.
+                available = (
+                    coin_info.get("availableToOrder")
+                    or coin_info.get("availableToBorrow")
+                    or coin_info.get("availableToWithdraw")
+                    or acct_available
+                    or "0"
+                )
+                self.log.info(
+                    "bybit balance raw | total=%s available=%s | coin_fields=%s | acct_available=%s",
+                    total, available, list(coin_info.keys()), acct_available,
+                )
                 return BalanceInfo(
                     exchange=self.name,
                     total_usdt=Decimal(total),
