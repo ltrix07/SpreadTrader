@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from decimal import Decimal, ROUND_DOWN
 from urllib.parse import quote, urlencode
 
+from aiohttp import ContentTypeError
+
 from ..models import BalanceInfo, ExchangeName, OrderResult, PositionInfo, Quote, Symbol
 from .base import ExchangeClient
 from .signing import hmac_sha256_hex, timestamp_ms
@@ -115,24 +117,37 @@ class MexcExchange(ExchangeClient):
             "Request-Time": ts,
             "Signature": signature,
             "Content-Type": "application/json",
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate",
+            "User-Agent": "python-requests/2.32.3",
+            "source": "CCXT",
         }
 
         if method_upper == "GET":
-            full_url = f"{url}?{request_param_str}" if request_param_str else url
-            async with self.session.get(full_url, headers=headers, timeout=self.request_timeout_sec) as response:
-                data = await response.json()
+            req_url = f"{url}?{request_param_str}" if request_param_str else url
+            request_kwargs: dict[str, object] = {}
         elif method_upper == "DELETE":
-            full_url = f"{url}?{request_param_str}" if request_param_str else url
-            async with self.session.delete(full_url, headers=headers, timeout=self.request_timeout_sec) as response:
-                data = await response.json()
+            req_url = f"{url}?{request_param_str}" if request_param_str else url
+            request_kwargs = {}
         else:
-            async with self.session.post(
-                url,
-                headers=headers,
-                data=request_body_str,
-                timeout=self.request_timeout_sec,
-            ) as response:
-                data = await response.json()
+            req_url = url
+            request_kwargs = {"data": request_body_str}
+
+        async with self.session.request(
+            method_upper,
+            req_url,
+            headers=headers,
+            timeout=self.request_timeout_sec,
+            **request_kwargs,
+        ) as response:
+            try:
+                data = await response.json(content_type=None)
+            except (ContentTypeError, json.JSONDecodeError):
+                text = await response.text()
+                snippet = " ".join(text.strip().split())[:300]
+                raise RuntimeError(
+                    f"MEXC HTTP {response.status} non-JSON response at {path}: {snippet}"
+                ) from None
 
         if not data.get("success", True):
             raise RuntimeError(f"MEXC API error: {data}")
