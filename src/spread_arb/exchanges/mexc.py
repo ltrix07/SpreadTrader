@@ -52,6 +52,28 @@ class MexcExchange(ExchangeClient):
             return f"{base}_USDT"
         return symbol
 
+    @staticmethod
+    def _extract_order_id(payload: object) -> str:
+        """MEXC may return order id as int/str or nested in dict."""
+        if payload is None:
+            return ""
+        if isinstance(payload, (int, str)):
+            return str(payload)
+        if isinstance(payload, dict):
+            value = (
+                payload.get("orderId")
+                or payload.get("id")
+                or payload.get("data")
+            )
+            if value is None:
+                return ""
+            if isinstance(value, (int, str)):
+                return str(value)
+            if isinstance(value, dict):
+                nested = value.get("orderId") or value.get("id")
+                return str(nested or "")
+        return ""
+
     async def fetch_quote(self, symbol: Symbol) -> Quote:
         started = time.perf_counter()
         mexc_symbol = self._to_mexc_symbol(symbol)
@@ -276,11 +298,15 @@ class MexcExchange(ExchangeClient):
                 "openType": 2,
             },
         )
-        order_id = str(data.get("orderId", ""))
-        detail = {}
+        order_id = self._extract_order_id(data)
+        detail: dict[str, object] = {}
         if order_id:
             try:
-                detail = await self._signed_request("GET", f"/api/v1/private/order/get/{order_id}")
+                raw_detail = await self._signed_request("GET", f"/api/v1/private/order/get/{order_id}")
+                if isinstance(raw_detail, dict):
+                    detail = raw_detail
+                elif isinstance(raw_detail, list) and raw_detail and isinstance(raw_detail[0], dict):
+                    detail = raw_detail[0]
             except Exception:
                 detail = {}
 
@@ -337,8 +363,7 @@ class MexcExchange(ExchangeClient):
                 "openType": 2,
             },
         )
-        order_id = data.get("orderId") or data.get("id") or data.get("data")
-        return str(order_id or "")
+        return self._extract_order_id(data)
 
     async def cancel_order(self, symbol: str, order_id: str) -> None:
         mexc_symbol = self._to_mexc_symbol(symbol)
