@@ -249,14 +249,12 @@ class BybitExchange(ExchangeClient):
             coin_name = coin_info.get("coin") or coin_info.get("coinName")
             if coin_name == "USDT":
                 total = coin_info.get("walletBalance") or coin_info.get("equity") or "0"
-                # Prefer coin-level availableToOrder; fall back to account-level.
-                available = (
-                    coin_info.get("availableToOrder")
-                    or coin_info.get("availableToBorrow")
-                    or coin_info.get("availableToWithdraw")
-                    or acct_available
-                    or "0"
-                )
+                # Compute available from equity minus margin in use.
+                # Bybit UTA sometimes returns empty strings for available fields.
+                equity = Decimal(coin_info.get("equity") or "0")
+                order_im = Decimal(coin_info.get("totalOrderIM") or "0")
+                position_im = Decimal(coin_info.get("totalPositionIM") or "0")
+                available = str(equity - order_im - position_im)
                 self.log.info(
                     "bybit balance raw | walletBalance=%s equity=%s bonus=%s locked=%s "
                     "totalOrderIM=%s totalPositionIM=%s availableToWithdraw=%s acct_available=%s",
