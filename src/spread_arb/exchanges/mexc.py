@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import time
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_DOWN
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from ..models import BalanceInfo, ExchangeName, OrderResult, PositionInfo, Quote, Symbol
 from .base import ExchangeClient
@@ -93,12 +94,17 @@ class MexcExchange(ExchangeClient):
         if method_upper in {"GET", "DELETE"}:
             # MEXC contract signature string for GET/DELETE:
             # sorted URL-encoded service params joined by '&'.
-            request_param_str = urlencode(sorted(req_params.items()))
+            request_param_str = urlencode(
+                sorted(req_params.items()),
+                quote_via=quote,
+            )
+            request_body_str = ""
         else:
             # MEXC contract signature string for POST:
             # JSON body string as-is (no key sorting required).
-            import json
-            request_param_str = json.dumps(req_params, separators=(",", ":"), ensure_ascii=False)
+            # IMPORTANT: the signed string and the request body must be identical.
+            request_body_str = json.dumps(req_params, separators=(",", ":"), ensure_ascii=False)
+            request_param_str = request_body_str
 
         sign_payload = f"{self.api_key}{ts}{request_param_str}"
         signature = hmac_sha256_hex(self.api_secret, sign_payload)
@@ -123,7 +129,7 @@ class MexcExchange(ExchangeClient):
             async with self.session.post(
                 url,
                 headers=headers,
-                json=req_params,
+                data=request_body_str,
                 timeout=self.request_timeout_sec,
             ) as response:
                 data = await response.json()
