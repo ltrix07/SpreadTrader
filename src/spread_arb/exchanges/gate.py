@@ -373,7 +373,6 @@ class GateExchange(ExchangeClient):
             "tif": "ioc",
         }
         if close:
-            request_body["close"] = True
             request_body["reduce_only"] = True
 
         placed = await self._signed_request("POST", "/api/v4/futures/usdt/orders", body=request_body)
@@ -431,7 +430,6 @@ class GateExchange(ExchangeClient):
                 "size": signed_size,
                 "price": "0",
                 "tif": "ioc",
-                "close": True,
                 "reduce_only": True,
             },
             "trigger": {
