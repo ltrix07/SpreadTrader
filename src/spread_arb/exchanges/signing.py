@@ -27,6 +27,20 @@ def hmac_sha256_base64(secret: str, message: str) -> str:
     return base64.b64encode(signature).decode("utf-8")
 
 
+def hmac_sha512_hex(secret: str, message: str) -> str:
+    """HMAC-SHA512, return hex digest. Used by Gate.io."""
+    return hmac.new(
+        secret.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha512,
+    ).hexdigest()
+
+
+def sha512_hex(message: str) -> str:
+    """SHA-512 hash, return hex digest."""
+    return hashlib.sha512(message.encode("utf-8")).hexdigest()
+
+
 def timestamp_ms() -> int:
     """Current UTC timestamp in milliseconds."""
     return int(time.time() * 1000)

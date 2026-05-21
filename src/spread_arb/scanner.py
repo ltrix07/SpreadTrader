@@ -90,6 +90,7 @@ class QuoteScanner:
                             ExchangeName.BINANCE,
                             ExchangeName.OKX,
                             ExchangeName.BYBIT,
+                            ExchangeName.GATE,
                             ExchangeName.BITGET,
                             ExchangeName.MEXC,
                         }
@@ -754,6 +755,10 @@ class QuoteScanner:
             ExchangeName.MEXC: {
                 "api_key": settings.api_key_mexc,
                 "api_secret": settings.api_secret_mexc,
+            },
+            ExchangeName.GATE: {
+                "api_key": settings.api_key_gate,
+                "api_secret": settings.api_secret_gate,
             },
         }
 

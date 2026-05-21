@@ -12,6 +12,8 @@ from .models import ExchangeName, Quote
 from .opportunity import SpreadOpportunity, classify_opportunity
 from .storage import OpportunityStore, PaperTradeRecord
 
+_log = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class CloseDecision:
@@ -90,6 +92,16 @@ def calculate_pnl(
     entry_slippage_usdt: float,
     exit_slippage_usdt: float,
 ) -> PnlResult:
+    # Guard against zero/missing prices from exchange API failures.
+    # Fall back to entry price (= zero PnL on that leg) rather than
+    # recording a catastrophic fake loss.
+    if exit_long_price <= 0:
+        _log.warning("exit_long_price is %.8f — using entry price %.8f as fallback", exit_long_price, entry_long_price)
+        exit_long_price = entry_long_price
+    if exit_short_price <= 0:
+        _log.warning("exit_short_price is %.8f — using entry price %.8f as fallback", exit_short_price, entry_short_price)
+        exit_short_price = entry_short_price
+
     long_pnl = notional_usdt * (exit_long_price - entry_long_price) / entry_long_price
     short_pnl = notional_usdt * (entry_short_price - exit_short_price) / entry_short_price
     gross_pnl_usdt = long_pnl + short_pnl

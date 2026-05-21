@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import time
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_DOWN
@@ -274,6 +276,54 @@ class MexcExchange(ExchangeClient):
             return 4 if position.size > 0 else 3
         raise ValueError(f"Unsupported side: {side}")
 
+    @staticmethod
+    def _extract_avg_price(detail: dict[str, object]) -> Decimal:
+        """Extract fill price from MEXC order detail, trying multiple field names."""
+        for field in ("dealAvgPrice", "avgPrice", "price"):
+            raw = detail.get(field)
+            if raw is not None:
+                val = Decimal(str(raw))
+                if val > 0:
+                    return val
+        return Decimal("0")
+
+    async def _fetch_order_detail_with_retry(
+        self,
+        order_id: str,
+        max_attempts: int = 3,
+        delay_sec: float = 0.5,
+    ) -> dict[str, object]:
+        """Fetch order detail, retrying until avgPrice is populated."""
+        log = getattr(self, "log", logging.getLogger(__name__))
+        if not order_id:
+            return {}
+
+        detail: dict[str, object] = {}
+        for attempt in range(1, max_attempts + 1):
+            await asyncio.sleep(delay_sec)
+            try:
+                raw_detail = await self._signed_request(
+                    "GET", f"/api/v1/private/order/get/{order_id}",
+                )
+                if isinstance(raw_detail, dict):
+                    detail = raw_detail
+                elif isinstance(raw_detail, list) and raw_detail and isinstance(raw_detail[0], dict):
+                    detail = raw_detail[0]
+                else:
+                    detail = {}
+            except Exception as exc:
+                log.warning("MEXC order detail fetch attempt %d failed: %s", attempt, exc)
+                continue
+
+            if self._extract_avg_price(detail) > 0:
+                return detail
+            log.info(
+                "MEXC order detail attempt %d/%d: avgPrice still 0, retrying...",
+                attempt, max_attempts,
+            )
+
+        return detail
+
     async def place_market_order(
         self,
         symbol: str,
@@ -299,16 +349,7 @@ class MexcExchange(ExchangeClient):
             },
         )
         order_id = self._extract_order_id(data)
-        detail: dict[str, object] = {}
-        if order_id:
-            try:
-                raw_detail = await self._signed_request("GET", f"/api/v1/private/order/get/{order_id}")
-                if isinstance(raw_detail, dict):
-                    detail = raw_detail
-                elif isinstance(raw_detail, list) and raw_detail and isinstance(raw_detail[0], dict):
-                    detail = raw_detail[0]
-            except Exception:
-                detail = {}
+        detail = await self._fetch_order_detail_with_retry(order_id)
 
         filled_contracts = Decimal(
             str(
@@ -317,11 +358,18 @@ class MexcExchange(ExchangeClient):
                 or contracts
             )
         )
-        avg_price = Decimal(str(detail.get("avgPrice") or detail.get("price") or "0"))
+        avg_price = self._extract_avg_price(detail)
         fee = Decimal(str(detail.get("fee") or detail.get("takerFee") or "0")).copy_abs()
         update_time = detail.get("updateTime") or detail.get("createTime") or timestamp_ms()
         status = str(detail.get("state") or detail.get("status") or "")
         filled_qty = await self._contracts_to_base_qty(symbol, filled_contracts)
+
+        if avg_price <= 0:
+            self.log.error(
+                "MEXC avg_price=0 after retries | symbol=%s side=%s order_id=%s detail=%s",
+                symbol, side, order_id, detail,
+            )
+
         return OrderResult(
             exchange=self.name,
             symbol=symbol,

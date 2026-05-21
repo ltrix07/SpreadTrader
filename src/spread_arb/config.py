@@ -113,6 +113,8 @@ class Settings(BaseSettings):
     api_passphrase_bitget: str = ""
     api_key_mexc: str = ""
     api_secret_mexc: str = ""
+    api_key_gate: str = ""
+    api_secret_gate: str = ""
 
     @staticmethod
     def _parse_list_env(value: Any) -> list[str] | Any:

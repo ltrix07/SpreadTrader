@@ -35,6 +35,7 @@ EXCHANGE_MAP = {
     "bybit": ExchangeName.BYBIT,
     "bitget": ExchangeName.BITGET,
     "mexc": ExchangeName.MEXC,
+    "gate": ExchangeName.GATE,
 }
 
 
@@ -55,6 +56,9 @@ def get_client_class(exchange: ExchangeName):
     if exchange == ExchangeName.MEXC:
         from spread_arb.exchanges.mexc import MexcExchange
         return MexcExchange
+    if exchange == ExchangeName.GATE:
+        from spread_arb.exchanges.gate import GateExchange
+        return GateExchange
     raise ValueError(f"Unsupported exchange: {exchange}")
 
 
@@ -78,6 +82,8 @@ def get_credentials(settings, exchange: ExchangeName) -> dict:
         }
     if exchange == ExchangeName.MEXC:
         return {"api_key": settings.api_key_mexc, "api_secret": settings.api_secret_mexc}
+    if exchange == ExchangeName.GATE:
+        return {"api_key": settings.api_key_gate, "api_secret": settings.api_secret_gate}
     raise ValueError(f"No credentials for {exchange}")
 
 
@@ -219,7 +225,7 @@ async def run_test(exchange_name: str, symbol: str, notional: float, leverage: i
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Test exchange order execution")
-    parser.add_argument("--exchange", required=True, choices=["binance", "okx", "bybit", "bitget", "mexc"])
+    parser.add_argument("--exchange", required=True, choices=["binance", "okx", "bybit", "bitget", "mexc", "gate"])
     parser.add_argument("--symbol", default="SOLUSDT", help="Symbol to test (default: SOLUSDT)")
     parser.add_argument("--notional", type=float, default=10.0, help="Notional in USDT (default: 10)")
     parser.add_argument("--leverage", type=int, default=1, help="Leverage (default: 1)")
