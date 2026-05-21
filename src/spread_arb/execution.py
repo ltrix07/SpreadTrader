@@ -30,20 +30,19 @@ class ExecutionService:
         self._step_size_cache: dict[tuple[ExchangeName, str], Decimal] = {}
         self._balance_cache: dict[ExchangeName, tuple[float, float]] = {}
         self._balance_cache_ttl: float = 30.0
+        self._leverage_ok: set[tuple[ExchangeName, str, int]] = set()
+        self._leverage_last_fail_ts: dict[tuple[ExchangeName, str, int], float] = {}
+        self._leverage_fail_cooldown_sec: float = 300.0
 
     async def initialize(self, symbols: list[str]) -> None:
-        """Set leverage on all exchanges for all symbols. Call once at startup."""
-        leverage = self.settings.default_leverage
-        for name, client in self.clients.items():
-            for symbol in symbols:
-                try:
-                    await client.set_leverage(symbol, leverage)
-                    self.log.info("set leverage %dx on %s for %s", leverage, name.value, symbol)
-                except NotImplementedError:
-                    self.log.debug("leverage not supported on %s", name.value)
-                except Exception as exc:
-                    # Some exchanges error if leverage is already set - ignore.
-                    self.log.warning("set_leverage failed on %s %s: %s", name.value, symbol, exc)
+        """Initialize execution caches. Leverage is set lazily on first real trade."""
+        _ = symbols
+        self._min_qty_cache.clear()
+        self._step_size_cache.clear()
+        self._balance_cache.clear()
+        self._leverage_ok.clear()
+        self._leverage_last_fail_ts.clear()
+        self.log.info("execution initialized: leverage will be set lazily on first trade per symbol")
 
     async def get_balance(self, exchange: ExchangeName) -> BalanceInfo:
         return await self.clients[exchange].get_balance()
@@ -119,6 +118,10 @@ class ExecutionService:
 
         long_client = self.clients[long_exchange]
         short_client = self.clients[short_exchange]
+        await asyncio.gather(
+            self._ensure_leverage(long_exchange, symbol),
+            self._ensure_leverage(short_exchange, symbol),
+        )
 
         long_price = float(long_quote.best_ask_price)
         short_price = float(short_quote.best_bid_price)
@@ -342,3 +345,31 @@ class ExecutionService:
             raise ExecutionError(
                 f"qty {qty} below minimum {min_qty} on {exchange.value} for {symbol}"
             )
+
+    async def _ensure_leverage(self, exchange: ExchangeName, symbol: str) -> None:
+        """
+        Best-effort leverage setup with anti-spam cooldown.
+        Failure should not block execution, matching previous behavior.
+        """
+        leverage = int(self.settings.default_leverage)
+        key = (exchange, symbol, leverage)
+        if key in self._leverage_ok:
+            return
+
+        now = time.time()
+        last_fail = self._leverage_last_fail_ts.get(key)
+        if last_fail is not None and (now - last_fail) < self._leverage_fail_cooldown_sec:
+            return
+
+        client = self.clients[exchange]
+        try:
+            await client.set_leverage(symbol, leverage)
+            self._leverage_ok.add(key)
+            self._leverage_last_fail_ts.pop(key, None)
+            self.log.info("set leverage %dx on %s for %s", leverage, exchange.value, symbol)
+        except NotImplementedError:
+            self._leverage_ok.add(key)
+            self.log.debug("leverage not supported on %s", exchange.value)
+        except Exception as exc:
+            self._leverage_last_fail_ts[key] = now
+            self.log.warning("set_leverage failed on %s %s: %s", exchange.value, symbol, exc)

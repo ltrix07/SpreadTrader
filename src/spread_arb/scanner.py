@@ -113,7 +113,19 @@ class QuoteScanner:
 
                 if self.settings.use_websocket:
                     data_tasks = self._start_ws_feeds(session)
-                    mode = "websocket"
+                    # Start REST polls for exchanges without WS support.
+                    rest_exchanges = [
+                        ex for ex in exchanges
+                        if ex.name not in self._ws_supported_exchanges()
+                    ]
+                    if rest_exchanges:
+                        rest_tasks = self._start_rest_polls(rest_exchanges)
+                        data_tasks.extend(rest_tasks)
+                        self.log.info(
+                            "hybrid mode: WS + REST fallback for %s",
+                            [ex.name.value for ex in rest_exchanges],
+                        )
+                    mode = "websocket+REST" if rest_exchanges else "websocket"
                 else:
                     data_tasks = self._start_rest_polls(exchanges)
                     mode = "REST"
@@ -635,16 +647,22 @@ class QuoteScanner:
                         exc,
                     )
 
+    _WS_FACTORY: dict[ExchangeName, type[WebSocketFeed]] = {
+        ExchangeName.OKX: OkxWsFeed,
+        ExchangeName.BYBIT: BybitWsFeed,
+        ExchangeName.BINANCE: BinanceWsFeed,
+        ExchangeName.GATE: GateWsFeed,
+        ExchangeName.BITGET: BitgetWsFeed,
+        ExchangeName.HTX: HtxWsFeed,
+    }
+
+    @classmethod
+    def _ws_supported_exchanges(cls) -> set[ExchangeName]:
+        return set(cls._WS_FACTORY.keys())
+
     def _start_ws_feeds(self, session: aiohttp.ClientSession) -> list[asyncio.Task]:
         """Create WebSocket feed tasks for all configured exchanges."""
-        ws_factory: dict[ExchangeName, type[WebSocketFeed]] = {
-            ExchangeName.OKX: OkxWsFeed,
-            ExchangeName.BYBIT: BybitWsFeed,
-            ExchangeName.BINANCE: BinanceWsFeed,
-            ExchangeName.GATE: GateWsFeed,
-            ExchangeName.BITGET: BitgetWsFeed,
-            ExchangeName.HTX: HtxWsFeed,
-        }
+        ws_factory = self._WS_FACTORY
 
         tasks: list[asyncio.Task] = []
         for exchange_name in self.settings.exchanges:
