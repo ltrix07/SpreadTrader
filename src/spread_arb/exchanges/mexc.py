@@ -22,7 +22,7 @@ class MexcExchange(ExchangeClient):
         "https://contract.mexc.com",
         "https://futures.mexc.com",
     )
-    inter_request_delay_sec = 0.12  # ~120ms between requests to stay under MEXC rate limit.
+    inter_request_delay_sec = 0.22  # ~220ms between requests; 42 symbols ≈ 9s per cycle.
 
     def __init__(
         self,
