@@ -225,7 +225,7 @@ class GateExchange(ExchangeClient):
                     raise RuntimeError(f"Gate API error [{label}] ({response.status}): {message}")
             raise RuntimeError(f"Gate API error ({response.status}): {data}")
 
-        if isinstance(data, dict):
+        if isinstance(data, (dict, list)):
             return data
         raise RuntimeError(f"Unexpected Gate response type at {path}: {data}")
 
@@ -301,12 +301,19 @@ class GateExchange(ExchangeClient):
     async def get_position(self, symbol: str) -> PositionInfo:
         contract = self._to_gate_contract(symbol)
         try:
-            data = await self._signed_request("GET", f"/api/v4/futures/usdt/positions/{contract}")
+            raw = await self._signed_request("GET", f"/api/v4/futures/usdt/positions/{contract}")
         except RuntimeError as exc:
             if self._is_not_found_error(exc):
-                data = {}
+                raw = {}
             else:
                 raise
+
+        # Gate returns a list in dual mode (long + short entries) or a single dict.
+        if isinstance(raw, list):
+            # Find the entry with a non-zero size; fall back to first.
+            data = next((item for item in raw if int(item.get("size") or 0) != 0), raw[0] if raw else {})
+        else:
+            data = raw
 
         raw_size = Decimal(str(data.get("size") or "0"))
         if raw_size == 0:
@@ -316,7 +323,7 @@ class GateExchange(ExchangeClient):
                 size=Decimal("0"),
                 entry_price=Decimal("0"),
                 unrealized_pnl=Decimal("0"),
-                leverage=1,
+                leverage=int(Decimal(str(data.get("leverage") or data.get("lever") or "1"))),
             )
 
         size = await self._contracts_to_base_qty(symbol, raw_size.copy_abs())
@@ -328,7 +335,7 @@ class GateExchange(ExchangeClient):
             size=size,
             entry_price=Decimal(str(data.get("entry_price") or "0")),
             unrealized_pnl=Decimal(str(data.get("unrealised_pnl") or "0")),
-            leverage=int(Decimal(str(data.get("leverage") or "1"))),
+            leverage=int(Decimal(str(data.get("leverage") or data.get("lever") or "1"))),
         )
 
     async def set_leverage(self, symbol: str, leverage: int) -> None:
@@ -419,6 +426,14 @@ class GateExchange(ExchangeClient):
         contracts = await self._base_qty_to_contracts(symbol, qty)
         if contracts <= 0:
             raise RuntimeError(f"Computed contract size is zero for stop order: {symbol}, qty={qty}")
+
+        # Round trigger price to exchange tick size.
+        detail = await self._contract_detail(symbol)
+        price_round = detail.get("order_price_round") or detail.get("mark_price_round")
+        if price_round:
+            tick = Decimal(str(price_round))
+            if tick > 0:
+                stop_price = (stop_price / tick).to_integral_value(rounding=ROUND_DOWN) * tick
 
         side_lower = side.lower()
         signed_size = contracts if side_lower == "buy" else -contracts
