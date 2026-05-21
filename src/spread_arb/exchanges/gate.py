@@ -349,7 +349,7 @@ class GateExchange(ExchangeClient):
         detail = await self._contract_detail(symbol)
         min_contracts = Decimal(str(detail.get("order_size_min") or "0"))
         if min_contracts <= 0:
-            raise RuntimeError(f"Gate order_size_min missing for {symbol}: {detail}")
+            min_contracts = Decimal("1")
         return await self._contracts_to_base_qty(symbol, min_contracts)
 
     async def place_market_order(
