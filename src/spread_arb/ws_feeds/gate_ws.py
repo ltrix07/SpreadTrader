@@ -65,6 +65,34 @@ class GateWsFeed(WebSocketFeed):
             }))
         return messages
 
+    def _build_subscribe_messages_for(self, symbols: list[str]) -> list[str]:
+        contracts = [self._to_gate_contract(s) for s in symbols]
+        messages = []
+        batch_size = self.subscribe_batch_size
+        for i in range(0, len(contracts), batch_size):
+            batch = contracts[i : i + batch_size]
+            messages.append(json.dumps({
+                "time": int(time.time()),
+                "channel": "futures.book_ticker",
+                "event": "subscribe",
+                "payload": batch,
+            }))
+        return messages
+
+    def _build_unsubscribe_messages_for(self, symbols: list[str]) -> list[str]:
+        contracts = [self._to_gate_contract(s) for s in symbols]
+        messages = []
+        batch_size = self.subscribe_batch_size
+        for i in range(0, len(contracts), batch_size):
+            batch = contracts[i : i + batch_size]
+            messages.append(json.dumps({
+                "time": int(time.time()),
+                "channel": "futures.book_ticker",
+                "event": "unsubscribe",
+                "payload": batch,
+            }))
+        return messages
+
     def _ping_payload(self) -> str:
         return json.dumps({
             "time": int(time.time()),

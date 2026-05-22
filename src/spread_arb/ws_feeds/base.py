@@ -59,10 +59,85 @@ class WebSocketFeed(ABC):
         """Return JSON strings to send after WS connect to subscribe to BBO."""
         raise NotImplementedError
 
+    def _build_subscribe_messages_for(self, symbols: list[str]) -> list[str]:
+        """Build subscribe messages for a subset of symbols (hot-reload support)."""
+        if not symbols:
+            return []
+        original_symbols = list(self.symbols)
+        try:
+            self.symbols = list(symbols)
+            return self._build_subscribe_messages()
+        finally:
+            self.symbols = original_symbols
+
+    def _build_unsubscribe_messages_for(self, symbols: list[str]) -> list[str]:
+        """Build unsubscribe messages for a subset of symbols."""
+        messages = self._build_subscribe_messages_for(symbols)
+        return [self._to_unsubscribe_message(msg) for msg in messages]
+
     @abstractmethod
     def _parse_message(self, raw: str | bytes) -> Quote | None:
         """Parse an incoming WS message into a Quote, or None if irrelevant."""
         raise NotImplementedError
+
+    async def subscribe_symbols(self, symbols: list[str]) -> None:
+        """Subscribe to additional symbols on the live WS connection."""
+        if not symbols or self._ws is None or self._ws.closed:
+            return
+        new_symbols = [s for s in symbols if s not in self.symbols]
+        if not new_symbols:
+            return
+        self.symbols.extend(new_symbols)
+        for msg in self._build_subscribe_messages_for(new_symbols):
+            await self._ws.send_str(msg)
+            await asyncio.sleep(0.1)
+        self.log.info("subscribed to %d new symbols: %s", len(new_symbols), new_symbols[:5])
+
+    async def unsubscribe_symbols(self, symbols: list[str]) -> None:
+        """Unsubscribe from symbols on the live WS connection."""
+        if not symbols or self._ws is None or self._ws.closed:
+            return
+        existing = set(self.symbols)
+        remove_symbols = [s for s in symbols if s in existing]
+        if not remove_symbols:
+            return
+        symbols_set = set(remove_symbols)
+        self.symbols = [s for s in self.symbols if s not in symbols_set]
+        for msg in self._build_unsubscribe_messages_for(remove_symbols):
+            await self._ws.send_str(msg)
+            await asyncio.sleep(0.1)
+        self.log.info("unsubscribed from %d symbols: %s", len(remove_symbols), remove_symbols[:5])
+
+    def _to_unsubscribe_message(self, subscribe_message: str) -> str:
+        """Best-effort conversion from subscribe payload to unsubscribe payload."""
+        try:
+            payload = json.loads(subscribe_message)
+        except json.JSONDecodeError:
+            return (
+                subscribe_message.replace("SUBSCRIBE", "UNSUBSCRIBE")
+                .replace('"subscribe"', '"unsubscribe"')
+                .replace('"sub"', '"unsub"')
+            )
+
+        if isinstance(payload, dict):
+            method = payload.get("method")
+            if isinstance(method, str) and method.upper() == "SUBSCRIBE":
+                payload["method"] = "UNSUBSCRIBE"
+
+            op = payload.get("op")
+            if isinstance(op, str) and op.lower() == "subscribe":
+                payload["op"] = "unsubscribe"
+
+            event = payload.get("event")
+            if isinstance(event, str) and event.lower() == "subscribe":
+                payload["event"] = "unsubscribe"
+
+            sub = payload.get("sub")
+            if isinstance(sub, str):
+                payload.pop("sub", None)
+                payload["unsub"] = sub
+
+        return json.dumps(payload)
 
     def _ping_payload(self) -> str | bytes | None:
         """Return the ping payload to send. None = use WS-level ping."""

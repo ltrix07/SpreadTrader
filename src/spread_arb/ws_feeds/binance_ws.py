@@ -51,6 +51,34 @@ class BinanceWsFeed(WebSocketFeed):
             }))
         return messages
 
+    def _build_subscribe_messages_for(self, symbols: list[str]) -> list[str]:
+        binance_symbols = [self._to_binance(s) for s in symbols]
+        params = [f"{s.lower()}@bookTicker" for s in binance_symbols]
+        messages = []
+        batch_size = 50
+        for i in range(0, len(params), batch_size):
+            batch = params[i : i + batch_size]
+            messages.append(json.dumps({
+                "method": "SUBSCRIBE",
+                "params": batch,
+                "id": 1000 + i,
+            }))
+        return messages
+
+    def _build_unsubscribe_messages_for(self, symbols: list[str]) -> list[str]:
+        binance_symbols = [self._to_binance(s) for s in symbols]
+        params = [f"{s.lower()}@bookTicker" for s in binance_symbols]
+        messages = []
+        batch_size = 50
+        for i in range(0, len(params), batch_size):
+            batch = params[i : i + batch_size]
+            messages.append(json.dumps({
+                "method": "UNSUBSCRIBE",
+                "params": batch,
+                "id": 2000 + i,
+            }))
+        return messages
+
     def _ping_payload(self) -> str | bytes | None:
         # Binance WS uses native WS pings (aiohttp heartbeat handles it).
         return None

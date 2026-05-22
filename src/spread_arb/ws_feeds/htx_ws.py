@@ -63,6 +63,22 @@ class HtxWsFeed(WebSocketFeed):
             messages.append(json.dumps({"sub": topic, "id": f"bbo_{contract}"}))
         return messages
 
+    def _build_subscribe_messages_for(self, symbols: list[str]) -> list[str]:
+        messages = []
+        for s in symbols:
+            contract = self._to_htx_contract(s)
+            topic = f"market.{contract}.bbo"
+            messages.append(json.dumps({"sub": topic, "id": f"bbo_{contract}"}))
+        return messages
+
+    def _build_unsubscribe_messages_for(self, symbols: list[str]) -> list[str]:
+        messages = []
+        for s in symbols:
+            contract = self._to_htx_contract(s)
+            topic = f"market.{contract}.bbo"
+            messages.append(json.dumps({"unsub": topic, "id": f"bbo_{contract}"}))
+        return messages
+
     def _ping_payload(self) -> str | bytes | None:
         # HTX server sends pings; we respond in _handle_server_ping.
         # No need for our own ping loop.

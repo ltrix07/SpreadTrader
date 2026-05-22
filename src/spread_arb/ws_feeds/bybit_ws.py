@@ -47,6 +47,26 @@ class BybitWsFeed(WebSocketFeed):
             messages.append(json.dumps({"op": "subscribe", "args": batch}))
         return messages
 
+    def _build_subscribe_messages_for(self, symbols: list[str]) -> list[str]:
+        bybit_symbols = [self._to_bybit(s) for s in symbols]
+        args = [f"orderbook.1.{s}" for s in bybit_symbols]
+        messages = []
+        batch_size = 10
+        for i in range(0, len(args), batch_size):
+            batch = args[i : i + batch_size]
+            messages.append(json.dumps({"op": "subscribe", "args": batch}))
+        return messages
+
+    def _build_unsubscribe_messages_for(self, symbols: list[str]) -> list[str]:
+        bybit_symbols = [self._to_bybit(s) for s in symbols]
+        args = [f"orderbook.1.{s}" for s in bybit_symbols]
+        messages = []
+        batch_size = 10
+        for i in range(0, len(args), batch_size):
+            batch = args[i : i + batch_size]
+            messages.append(json.dumps({"op": "unsubscribe", "args": batch}))
+        return messages
+
     def _ping_payload(self) -> str:
         return json.dumps({"op": "ping"})
 

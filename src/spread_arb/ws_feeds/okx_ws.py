@@ -58,6 +58,24 @@ class OkxWsFeed(WebSocketFeed):
             messages.append(json.dumps({"op": "subscribe", "args": batch}))
         return messages
 
+    def _build_subscribe_messages_for(self, symbols: list[str]) -> list[str]:
+        args = [{"channel": "bbo-tbt", "instId": self._to_inst_id(s)} for s in symbols]
+        messages = []
+        batch_size = 50
+        for i in range(0, len(args), batch_size):
+            batch = args[i : i + batch_size]
+            messages.append(json.dumps({"op": "subscribe", "args": batch}))
+        return messages
+
+    def _build_unsubscribe_messages_for(self, symbols: list[str]) -> list[str]:
+        args = [{"channel": "bbo-tbt", "instId": self._to_inst_id(s)} for s in symbols]
+        messages = []
+        batch_size = 50
+        for i in range(0, len(args), batch_size):
+            batch = args[i : i + batch_size]
+            messages.append(json.dumps({"op": "unsubscribe", "args": batch}))
+        return messages
+
     def _ping_payload(self) -> str:
         return "ping"
 

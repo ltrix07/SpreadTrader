@@ -83,6 +83,16 @@ class Settings(BaseSettings):
     mr_excluded_exchanges: list[str] = Field(default_factory=lambda: ["htx"])
     mr_quote_freshness_window: int = Field(default=30, ge=5)
     mr_min_quote_freshness_pct: float = Field(default=80.0, ge=0, le=100)
+    mr_max_bbo_spread_bps: float = Field(default=15.0, ge=0)
+    # Dynamic symbol rotation
+    dynamic_rotation_enabled: bool = False
+    dynamic_max_symbols: int = Field(default=15, ge=0)
+    dynamic_min_spread_pct: float = Field(default=0.08, ge=0)
+    dynamic_max_bbo_bps: float = Field(default=15.0, ge=0)
+    dynamic_session_times_utc: list[str] = Field(default_factory=lambda: ["00:30", "08:30", "16:30"])
+    dynamic_scan_timeout_sec: float = Field(default=15.0, gt=0)
+    dynamic_retry_interval_sec: float = Field(default=30.0, gt=0)
+    dynamic_require_exchanges: int = Field(default=3, ge=2)
 
     use_websocket: bool = True
 
@@ -149,6 +159,14 @@ class Settings(BaseSettings):
         parsed = cls._parse_list_env(value)
         if isinstance(parsed, list):
             return [item.upper() for item in parsed]
+        return parsed
+
+    @field_validator("dynamic_session_times_utc", mode="before")
+    @classmethod
+    def _parse_session_times(cls, value: Any) -> Any:
+        parsed = cls._parse_list_env(value)
+        if isinstance(parsed, list):
+            return [item.strip() for item in parsed]
         return parsed
 
     @field_validator("mr_excluded_exchanges", mode="before")

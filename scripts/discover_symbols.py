@@ -195,6 +195,7 @@ class SymbolSpread:
     spreads: dict[str, float]
     num_exchanges: int
     is_new: bool
+    max_bbo_bps: float
 
 
 def calc_spreads(
@@ -209,6 +210,11 @@ def calc_spreads(
     spreads = {}
     max_spread = 0.0
     best_pair = ""
+    max_bbo = 0.0
+
+    for _ex_name, (bid, ask) in quotes.items():
+        bbo_bps = (ask - bid) / bid * 10_000 if bid > 0 else 0.0
+        max_bbo = max(max_bbo, bbo_bps)
 
     for ex_a, ex_b in combinations(exchanges, 2):
         bid_a, ask_a = quotes[ex_a]
@@ -237,6 +243,7 @@ def calc_spreads(
         spreads=spreads,
         num_exchanges=len(exchanges),
         is_new=symbol not in CURRENT_SYMBOLS,
+        max_bbo_bps=max_bbo,
     )
 
 
@@ -244,7 +251,7 @@ def calc_spreads(
 # Main
 # ---------------------------------------------------------------------------
 
-async def run(top_n: int, min_spread: float, show_current: bool) -> None:
+async def run(top_n: int, min_spread: float, show_current: bool, max_bbo: float) -> None:
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         # Step 1: Fetch all symbols from each exchange
@@ -314,23 +321,34 @@ async def run(top_n: int, min_spread: float, show_current: bool) -> None:
         # Step 4: Calculate spreads
         print(f"\nCalculating spreads for {len(all_quotes)} symbols...")
         results_list: list[SymbolSpread] = []
+        bbo_filtered_count = 0
         for sym in sorted(all_quotes):
             spread = calc_spreads(sym, all_quotes[sym])
-            if spread and spread.max_spread_pct >= min_spread:
+            if spread is None:
+                continue
+            if max_bbo > 0 and spread.max_bbo_bps > max_bbo:
+                bbo_filtered_count += 1
+                continue
+            if spread.max_spread_pct >= min_spread:
                 results_list.append(spread)
 
         results_list.sort(key=lambda x: x.max_spread_pct, reverse=True)
 
         # Step 5: Print results
-        print(f"\n{'='*80}")
+        print(f"\n{'='*96}")
         print(f"TOP {top_n} SYMBOLS BY CURRENT SPREAD (min {min_spread}%)")
-        print(f"{'='*80}")
-        print(f"{'#':>3} {'Symbol':<18} {'Spread%':>8} {'Direction':<20} {'Exch':>4} {'Status':<8}")
-        print("-" * 80)
+        print(f"{'='*96}")
+        print(f"{'#':>3} {'Symbol':<18} {'Spread%':>8} {'Direction':<20} {'Exch':>4} {'BBO_bps':>8} {'Status':<8}")
+        print("-" * 96)
 
         for i, s in enumerate(results_list[:top_n], 1):
             status = "NEW" if s.is_new else "current"
-            print(f"{i:>3} {s.symbol:<18} {s.max_spread_pct:>8.4f} {s.best_pair:<20} {s.num_exchanges:>4} {status:<8}")
+            print(
+                f"{i:>3} {s.symbol:<18} {s.max_spread_pct:>8.4f} {s.best_pair:<20} "
+                f"{s.num_exchanges:>4} {s.max_bbo_bps:>8.1f} {status:<8}"
+            )
+
+        print(f"Filtered by BBO (>{max_bbo} bps): {bbo_filtered_count}")
 
         # Summary for new symbols
         new_candidates = [s for s in results_list if s.is_new]
@@ -362,10 +380,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Discover high-spread symbols across exchanges")
     parser.add_argument("--top", type=int, default=50, help="Show top N results (default: 50)")
     parser.add_argument("--min-spread", type=float, default=0.05, help="Min spread %% to show (default: 0.05)")
+    parser.add_argument("--max-bbo", type=float, default=15.0, help="Max BBO spread in bps per exchange (default: 15)")
     parser.add_argument("--all", action="store_true", help="Show current + new symbols (default: new only)")
     args = parser.parse_args()
 
-    asyncio.run(run(args.top, args.min_spread, args.all))
+    asyncio.run(run(args.top, args.min_spread, args.all, args.max_bbo))
 
 
 if __name__ == "__main__":

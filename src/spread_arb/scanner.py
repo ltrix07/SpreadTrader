@@ -26,6 +26,7 @@ from .exchanges import (
 from .models import ExchangeName, Quote
 from .mean_reversion_engine import MeanReversionEngine
 from .opportunity import SpreadOpportunity, classify_opportunity
+from .symbol_rotator import SymbolRotator
 from .storage import OpportunityRecord, OpportunityStore, SpreadSnapshotRecord
 from .ws_feeds import (
     BinanceWsFeed,
@@ -53,6 +54,8 @@ class QuoteScanner:
         self.total_scans: int = 0
         self.opportunity_store: OpportunityStore | None = None
         self.mean_reversion_engine: MeanReversionEngine | None = None
+        self.symbol_rotator: SymbolRotator | None = None
+        self._ws_feeds: list[WebSocketFeed] = []
         self.live_clients: dict[ExchangeName, ExchangeClient] = {}
 
         self.exchange_fees_pct: dict[ExchangeName, float] = {
@@ -112,6 +115,19 @@ class QuoteScanner:
                     )
                     self.mean_reversion_engine.preload_baselines(self.settings.database_url)
 
+                self.symbol_rotator = None
+                if self.settings.dynamic_rotation_enabled:
+                    self.symbol_rotator = SymbolRotator(
+                        settings=self.settings,
+                        get_open_position_count=lambda: len(
+                            self.mean_reversion_engine.open_positions_by_symbol
+                        ) if self.mean_reversion_engine else 0,
+                        get_pending_entry_count=lambda: len(
+                            self.mean_reversion_engine.pending_entries_by_symbol
+                        ) if self.mean_reversion_engine else 0,
+                        on_symbols_changed=self._on_dynamic_symbols_changed,
+                    )
+
                 if self.settings.use_websocket:
                     data_tasks = self._start_ws_feeds(session)
                     # Start REST polls for exchanges without WS support.
@@ -164,6 +180,12 @@ class QuoteScanner:
                     self._collect_spread_snapshots(),
                     name="spread-snapshots",
                 )
+                rotator_task: asyncio.Task | None = None
+                if self.symbol_rotator is not None:
+                    rotator_task = asyncio.create_task(
+                        self.symbol_rotator.run(self.stop_event, session),
+                        name="symbol-rotator",
+                    )
 
                 await self.stop_event.wait()
 
@@ -179,6 +201,8 @@ class QuoteScanner:
                     bg_tasks.append(mr_summary_task)
                 if balance_snapshot_task is not None:
                     bg_tasks.append(balance_snapshot_task)
+                if rotator_task is not None:
+                    bg_tasks.append(rotator_task)
                 for task in bg_tasks:
                     task.cancel()
 
@@ -224,6 +248,10 @@ class QuoteScanner:
                     await asyncio.sleep(0)
 
     def _scan_symbol(self, symbol: str) -> None:
+        # Pause signal evaluation during dynamic rotation scan.
+        if self.symbol_rotator is not None and self.symbol_rotator.scanning:
+            return
+
         symbol_quotes = self.latest_quotes_by_symbol.get(symbol)
         if symbol_quotes is None or len(symbol_quotes) < 2:
             return
@@ -665,17 +693,24 @@ class QuoteScanner:
         """Create WebSocket feed tasks for all configured exchanges."""
         ws_factory = self._WS_FACTORY
 
+        self._ws_feeds = []
         tasks: list[asyncio.Task] = []
         for exchange_name in self.settings.exchanges:
             feed_cls = ws_factory.get(exchange_name)
             if feed_cls is None:
                 self.log.warning("no WS feed for exchange %s, skipping", exchange_name)
                 continue
+            active_symbols = (
+                self.symbol_rotator.get_all_active_symbols()
+                if self.symbol_rotator is not None
+                else self.settings.symbols
+            )
             feed = feed_cls(
                 session=session,
-                symbols=self.settings.symbols,
+                symbols=active_symbols,
                 on_quote=self._on_quote,
             )
+            self._ws_feeds.append(feed)
             tasks.append(
                 asyncio.create_task(
                     feed.run(self.stop_event),
@@ -683,6 +718,63 @@ class QuoteScanner:
                 )
             )
         return tasks
+
+    async def _on_dynamic_symbols_changed(self, added: list[str], removed: list[str]) -> None:
+        """Called by SymbolRotator when dynamic symbols change."""
+        if added:
+            for feed in self._ws_feeds:
+                try:
+                    await feed.subscribe_symbols(added)
+                except Exception as exc:  # noqa: BLE001
+                    self.log.warning(
+                        "failed to subscribe %s on %s: %s",
+                        added,
+                        feed.name.value,
+                        exc,
+                    )
+
+        if removed:
+            for feed in self._ws_feeds:
+                try:
+                    await feed.unsubscribe_symbols(removed)
+                except Exception as exc:  # noqa: BLE001
+                    self.log.warning(
+                        "failed to unsubscribe %s on %s: %s",
+                        removed,
+                        feed.name.value,
+                        exc,
+                    )
+
+            removed_set = set(removed)
+            self._dirty_symbols.difference_update(removed_set)
+            for symbol in removed_set:
+                self.latest_quotes_by_symbol.pop(symbol, None)
+                self.latest_raw_spread_by_symbol.pop(symbol, None)
+                self.latest_best_opportunity_by_symbol.pop(symbol, None)
+
+                keys_to_remove = [key for key in self.latest_quotes if key[1] == symbol]
+                for key in keys_to_remove:
+                    self.latest_quotes.pop(key, None)
+                    self.last_quote_at.pop(key, None)
+
+            if self.mean_reversion_engine is not None:
+                keys_to_remove = [
+                    key for key in self.mean_reversion_engine.baselines
+                    if key[0] in removed_set
+                ]
+                for key in keys_to_remove:
+                    del self.mean_reversion_engine.baselines[key]
+                self.mean_reversion_engine.baseline_ready_keys = {
+                    key for key in self.mean_reversion_engine.baseline_ready_keys
+                    if key[0] not in removed_set
+                }
+
+        self.log.info(
+            "dynamic symbols updated | active=%d (base=%d + dynamic=%d)",
+            len(self.symbol_rotator.get_all_active_symbols()) if self.symbol_rotator else len(self.settings.symbols),
+            len(self.settings.symbols),
+            len(self.symbol_rotator.current_dynamic_symbols) if self.symbol_rotator else 0,
+        )
 
     def _start_rest_polls(self, exchanges: list[ExchangeClient]) -> list[asyncio.Task]:
         """Create REST polling tasks for all configured exchanges (legacy mode)."""

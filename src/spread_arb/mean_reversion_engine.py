@@ -556,6 +556,18 @@ class MeanReversionEngine:
             if long_fresh < self._min_freshness_pct or short_fresh < self._min_freshness_pct:
                 return
 
+        long_bbo_bps = float(
+            (long_quote.best_ask_price - long_quote.best_bid_price)
+            / long_quote.best_bid_price
+        ) * 10_000
+        short_bbo_bps = float(
+            (short_quote.best_ask_price - short_quote.best_bid_price)
+            / short_quote.best_bid_price
+        ) * 10_000
+        max_bbo_bps = self.settings.mr_max_bbo_spread_bps
+        if max_bbo_bps > 0 and (long_bbo_bps > max_bbo_bps or short_bbo_bps > max_bbo_bps):
+            return
+
         key = (symbol, long_exchange, short_exchange)
         baseline = self.baselines.get(key)
         if baseline is None or not baseline.is_ready:
@@ -580,7 +592,7 @@ class MeanReversionEngine:
         long_fresh_pct = self._get_freshness_pct(long_exchange, symbol)
         short_fresh_pct = self._get_freshness_pct(short_exchange, symbol)
         self.log.info(
-            "mr signal | %s %s->%s | spread=%+.4f%% | mean=%+.4f%% | std=%.4f%% | sigma=%.2f | net_edge=%+.4f%% | fresh=%.0f%%/%.0f%%",
+            "mr signal | %s %s->%s | spread=%+.4f%% | mean=%+.4f%% | std=%.4f%% | sigma=%.2f | net_edge=%+.4f%% | fresh=%.0f%%/%.0f%% | bbo=%.1f/%.1f",
             symbol,
             long_exchange.value,
             short_exchange.value,
@@ -591,6 +603,8 @@ class MeanReversionEngine:
             net_edge_pct,
             long_fresh_pct,
             short_fresh_pct,
+            long_bbo_bps,
+            short_bbo_bps,
         )
 
         if net_edge_pct < self.settings.mr_min_net_edge_pct:

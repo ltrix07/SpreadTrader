@@ -53,6 +53,26 @@ class BitgetWsFeed(WebSocketFeed):
             messages.append(json.dumps({"op": "subscribe", "args": batch}))
         return messages
 
+    def _build_subscribe_messages_for(self, symbols: list[str]) -> list[str]:
+        bitget_symbols = [self._to_bitget(s) for s in symbols]
+        args = [{"instType": "USDT-FUTURES", "channel": "ticker", "instId": s} for s in bitget_symbols]
+        messages = []
+        batch_size = 30
+        for i in range(0, len(args), batch_size):
+            batch = args[i : i + batch_size]
+            messages.append(json.dumps({"op": "subscribe", "args": batch}))
+        return messages
+
+    def _build_unsubscribe_messages_for(self, symbols: list[str]) -> list[str]:
+        bitget_symbols = [self._to_bitget(s) for s in symbols]
+        args = [{"instType": "USDT-FUTURES", "channel": "ticker", "instId": s} for s in bitget_symbols]
+        messages = []
+        batch_size = 30
+        for i in range(0, len(args), batch_size):
+            batch = args[i : i + batch_size]
+            messages.append(json.dumps({"op": "unsubscribe", "args": batch}))
+        return messages
+
     def _ping_payload(self) -> str:
         return "ping"
 
