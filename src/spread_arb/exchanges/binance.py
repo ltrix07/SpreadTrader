@@ -142,18 +142,22 @@ class BinanceExchange(ExchangeClient):
             "side": side.upper(),
             "type": "MARKET",
             "quantity": str(self._to_exchange_qty(symbol, qty)),
-            "newOrderRespType": "RESULT",
+            "newOrderRespType": "FULL",
         }
         if close:
             params["reduceOnly"] = "true"
         data = await self._signed_request("POST", "/fapi/v1/order", params)
+        # FULL response includes 'fills' array with per-fill commission.
+        total_fee = Decimal("0")
+        for fill in data.get("fills", []):
+            total_fee += Decimal(fill.get("commission", "0")).copy_abs()
         return OrderResult(
             exchange=self.name,
             symbol=symbol,
             side=side.lower(),
             filled_qty=self._to_canonical_qty(symbol, Decimal(data.get("executedQty", "0"))),
             avg_price=Decimal(data.get("avgPrice", "0")),
-            fee=Decimal(data.get("commission", "0")),
+            fee=total_fee,
             fee_currency="USDT",
             order_id=str(data.get("orderId", "")),
             timestamp=datetime.fromtimestamp(data.get("updateTime", timestamp_ms()) / 1000, tz=UTC),
