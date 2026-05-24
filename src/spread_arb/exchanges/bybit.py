@@ -156,6 +156,8 @@ class BybitExchange(ExchangeClient):
             "orderType": "Market",
             "qty": str(self._to_exchange_qty(symbol, qty)),
         }
+        if close:
+            params["reduceOnly"] = True
         data = await self._signed_request("POST", "/v5/order/create", params)
         order_id = data.get("orderId", "")
 

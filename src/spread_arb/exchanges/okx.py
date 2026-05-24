@@ -211,16 +211,19 @@ class OkxExchange(ExchangeClient):
         if contracts <= 0:
             raise RuntimeError(f"Computed contract size is zero for {symbol}, qty={qty}")
 
+        order_params = {
+            "instId": inst_id,
+            "tdMode": "cross",
+            "side": side.lower(),
+            "ordType": "market",
+            "sz": str(contracts),
+        }
+        if close:
+            order_params["reduceOnly"] = "true"
         order_data = await self._signed_request(
             "POST",
             "/api/v5/trade/order",
-            {
-                "instId": inst_id,
-                "tdMode": "cross",
-                "side": side.lower(),
-                "ordType": "market",
-                "sz": str(contracts),
-            },
+            order_params,
         )
         placed = order_data[0] if order_data else {}
         ord_id = placed.get("ordId", "")

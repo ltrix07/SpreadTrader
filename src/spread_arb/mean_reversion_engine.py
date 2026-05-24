@@ -187,7 +187,11 @@ class MeanReversionEngine:
                 return
 
             window = self.settings.mr_rolling_window
-            max_rows = window * 700
+            max_rows_cap = window * 700
+            exchange_count = len(self.settings.exchanges)
+            pair_count_per_symbol = exchange_count * (exchange_count - 1) // 2
+            estimated_rows = len(self.settings.symbols) * pair_count_per_symbol * window
+            max_rows = min(max_rows_cap, estimated_rows) if estimated_rows > 0 else max_rows_cap
             rows = conn.execute(
                 """
                 SELECT
@@ -207,30 +211,7 @@ class MeanReversionEngine:
                 self.log.info("preload: no snapshots found, starting cold")
                 return
 
-            loaded_count = 0
-            for row in reversed(rows):
-                symbol = str(row["symbol"])
-                ex_a_raw = str(row["exchange_a"])
-                ex_b_raw = str(row["exchange_b"])
-                try:
-                    ex_a = ExchangeName(ex_a_raw)
-                    ex_b = ExchangeName(ex_b_raw)
-                except ValueError:
-                    continue
-
-                self._update_baseline(
-                    symbol=symbol,
-                    long_exchange=ex_a,
-                    short_exchange=ex_b,
-                    spread_pct=float(row["raw_spread_ab_pct"]),
-                )
-                self._update_baseline(
-                    symbol=symbol,
-                    long_exchange=ex_b,
-                    short_exchange=ex_a,
-                    spread_pct=float(row["raw_spread_ba_pct"]),
-                )
-                loaded_count += 1
+            loaded_count = self._load_baselines_from_rows(rows)
         finally:
             self._preloading = False
             conn.close()
@@ -244,16 +225,183 @@ class MeanReversionEngine:
             ready_count,
         )
 
+    def preload_baselines_for_symbols(self, database_url: str, symbols: list[str]) -> None:
+        """Load recent spread snapshots for specific symbols into rolling baselines."""
+        import sqlite3
+
+        from .storage import _sqlite_path_from_url
+
+        target_symbols = [symbol.strip() for symbol in symbols if symbol and symbol.strip()]
+        if not target_symbols:
+            return
+
+        db_path = _sqlite_path_from_url(database_url)
+        if not db_path.exists():
+            self.log.warning("preload symbols: database not found at %s", db_path)
+            return
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        self._preloading = True
+        try:
+            has_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='spread_snapshots' LIMIT 1"
+            ).fetchone()
+            if has_table is None:
+                self.log.info("preload symbols: spread_snapshots table not found, starting cold")
+                return
+
+            window = self.settings.mr_rolling_window
+            max_rows = len(target_symbols) * 20 * window
+            placeholders = ",".join("?" for _ in target_symbols)
+            query = f"""
+                SELECT
+                    symbol,
+                    exchange_a,
+                    exchange_b,
+                    raw_spread_ab_pct,
+                    raw_spread_ba_pct
+                FROM spread_snapshots
+                WHERE symbol IN ({placeholders})
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """
+            rows = conn.execute(query, (*target_symbols, max_rows)).fetchall()
+
+            if not rows:
+                self.log.info("preload symbols: no snapshots found for %s", target_symbols)
+                return
+
+            loaded_count = self._load_baselines_from_rows(rows)
+        finally:
+            self._preloading = False
+            conn.close()
+
+        ready_count = len(self.baseline_ready_keys)
+        self.log.info(
+            "preload symbols complete | symbols=%s | loaded %d snapshots | %d baselines total | %d ready",
+            target_symbols,
+            loaded_count,
+            len(self.baselines),
+            ready_count,
+        )
+
+    def _load_baselines_from_rows(self, rows: list) -> int:
+        loaded_count = 0
+        for row in reversed(rows):
+            symbol = str(row["symbol"])
+            ex_a_raw = str(row["exchange_a"])
+            ex_b_raw = str(row["exchange_b"])
+            try:
+                ex_a = ExchangeName(ex_a_raw)
+                ex_b = ExchangeName(ex_b_raw)
+            except ValueError:
+                continue
+
+            self._update_baseline(
+                symbol=symbol,
+                long_exchange=ex_a,
+                short_exchange=ex_b,
+                spread_pct=float(row["raw_spread_ab_pct"]),
+            )
+            self._update_baseline(
+                symbol=symbol,
+                long_exchange=ex_b,
+                short_exchange=ex_a,
+                spread_pct=float(row["raw_spread_ba_pct"]),
+            )
+            loaded_count += 1
+        return loaded_count
+
     async def shutdown(self) -> None:
-        tasks = [pending.task for pending in self.pending_entries_by_symbol.values()]
-        tasks.extend(self.pending_closes_by_symbol.values())
-        for task in tasks:
+        # Cancel pending ENTRIES only (not closes — let them finish).
+        entry_tasks = [pending.task for pending in self.pending_entries_by_symbol.values()]
+        for task in entry_tasks:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if entry_tasks:
+            await asyncio.gather(*entry_tasks, return_exceptions=True)
         self.pending_entries_by_symbol.clear()
+
+        # Wait for in-flight closes to complete (avoid double-close).
+        close_tasks = list(self.pending_closes_by_symbol.values())
+        if close_tasks:
+            self.log.info("shutdown: waiting for %d pending close(s) to finish", len(close_tasks))
+            await asyncio.gather(*close_tasks, return_exceptions=True)
         self.pending_closes_by_symbol.clear()
+
+        if self.live_mode and self.open_positions_by_symbol:
+            self.log.warning(
+                "shutdown: closing %d open live position(s): %s",
+                len(self.open_positions_by_symbol),
+                list(self.open_positions_by_symbol.keys()),
+            )
+            for symbol, position in list(self.open_positions_by_symbol.items()):
+                try:
+                    await self._close_position(
+                        position=position,
+                        close_reason="shutdown",
+                        long_quote=self.get_latest_quote(position.long_exchange, symbol),
+                        short_quote=self.get_latest_quote(position.short_exchange, symbol),
+                    )
+                except Exception as exc:
+                    self.log.critical(
+                        "shutdown: FAILED to close %s | %s | POSITION MAY BE ORPHANED",
+                        symbol,
+                        exc,
+                    )
+
         self.log_summary()
+
+    async def recover_orphan_positions(self) -> None:
+        """Check exchanges for positions left by a previous bot run and close them."""
+        if not self.live_mode or self.execution_service is None:
+            return
+
+        self.log.info("checking for orphan positions on exchanges...")
+        symbols = list(self.settings.symbols)
+        orphans_found = 0
+
+        for symbol in symbols:
+            for exchange_name, client in self.execution_service.clients.items():
+                try:
+                    pos = await client.get_position(symbol)
+                    if abs(float(pos.size)) > 0:
+                        orphans_found += 1
+                        self.log.warning(
+                            "orphan position found | %s on %s | size=%s | entry=%s | upnl=%s",
+                            symbol,
+                            exchange_name.value,
+                            pos.size,
+                            pos.entry_price,
+                            pos.unrealized_pnl,
+                        )
+                        side = "sell" if float(pos.size) > 0 else "buy"
+                        qty = abs(pos.size)
+                        try:
+                            result = await client.place_market_order(symbol, side, qty, close=True)
+                            self.log.info(
+                                "orphan closed | %s on %s | filled=%s @ %s | fee=%s",
+                                symbol,
+                                exchange_name.value,
+                                result.filled_qty,
+                                result.avg_price,
+                                result.fee,
+                            )
+                        except Exception as close_exc:
+                            self.log.critical(
+                                "FAILED to close orphan | %s on %s | %s | MANUAL INTERVENTION REQUIRED",
+                                symbol,
+                                exchange_name.value,
+                                close_exc,
+                            )
+                except Exception as exc:
+                    self.log.debug("could not check %s on %s: %s", symbol, exchange_name.value, exc)
+            await asyncio.sleep(0.1)
+
+        if orphans_found == 0:
+            self.log.info("no orphan positions found")
+        else:
+            self.log.warning("closed %d orphan position(s)", orphans_found)
 
     async def summary_loop(self, stop_event: asyncio.Event) -> None:
         interval_sec = 60.0
@@ -274,6 +422,7 @@ class MeanReversionEngine:
             f"stop_loss={self.close_reason_counts.get('stop_loss', 0)}",
             f"timeout={self.close_reason_counts.get('timeout', 0)}",
             f"stale_quote={self.close_reason_counts.get('stale_quote', 0)}",
+            f"shutdown={self.close_reason_counts.get('shutdown', 0)}",
         ]
         top_symbols = sorted(self.symbol_pnl_usdt.items(), key=lambda item: item[1], reverse=True)[:5]
         top_symbols_text = ", ".join(f"{symbol}:{pnl:+.2f}" for symbol, pnl in top_symbols) if top_symbols else "-"

@@ -114,6 +114,8 @@ class QuoteScanner:
                         execution_service=execution_service,
                     )
                     self.mean_reversion_engine.preload_baselines(self.settings.database_url)
+                    if self.settings.live_trading and execution_service is not None:
+                        await self.mean_reversion_engine.recover_orphan_positions()
 
                 self.symbol_rotator = None
                 if self.settings.dynamic_rotation_enabled:
@@ -732,6 +734,11 @@ class QuoteScanner:
                         feed.name.value,
                         exc,
                     )
+            if self.mean_reversion_engine is not None:
+                self.mean_reversion_engine.preload_baselines_for_symbols(
+                    self.settings.database_url,
+                    added,
+                )
 
         if removed:
             for feed in self._ws_feeds:
