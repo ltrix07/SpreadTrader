@@ -656,7 +656,7 @@ class MeanReversionEngine:
         if pending is None:
             return
 
-        delay_sec = self.settings.simulated_execution_delay_ms / 1000.0
+        delay_sec = self.settings.mr_revalidation_delay_sec if self.settings.mr_revalidation_delay_sec > 0 else self.settings.simulated_execution_delay_ms / 1000.0
         try:
             await asyncio.sleep(delay_sec)
             current = self.pending_entries_by_symbol.get(symbol)
@@ -706,6 +706,15 @@ class MeanReversionEngine:
                 ask_long=long_quote.best_ask_price,
                 bid_short=short_quote.best_bid_price,
             )
+            # Re-validation spread floor check (spread must survive the delay)
+            reval_floor = self.settings.mr_revalidation_min_spread_pct
+            if reval_floor > 0 and current_spread_pct < reval_floor:
+                self.log.info(
+                    "mr reval REJECT | %s %s->%s | spread=%.4f%% < floor=%.4f%% | signal was %.4f%% %.1fs ago",
+                    symbol, current.long_exchange.value, current.short_exchange.value,
+                    current_spread_pct, reval_floor, current.signal_spread_pct, delay_sec,
+                )
+                return
             threshold = current.rolling_mean + (self.settings.mr_sigma_entry * current.rolling_std)
             if current_spread_pct <= threshold:
                 return
@@ -719,6 +728,12 @@ class MeanReversionEngine:
             net_edge_pct = expected_edge_pct - roundtrip_cost_pct
             if net_edge_pct < self.settings.mr_min_net_edge_pct:
                 return
+
+            self.log.info(
+                "mr reval CONFIRMED | %s %s->%s | spread=%.4f%% (was %.4f%%) | survived %.1fs delay | net_edge=%.4f%%",
+                symbol, current.long_exchange.value, current.short_exchange.value,
+                current_spread_pct, current.signal_spread_pct, delay_sec, net_edge_pct,
+            )
 
             entry_fees_usdt = _one_side_fees_usdt(
                 notional_usdt=notional,
