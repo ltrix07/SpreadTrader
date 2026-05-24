@@ -634,7 +634,9 @@ class MeanReversionEngine:
         if long_capacity < required_signal_notional or short_capacity < required_signal_notional:
             return
 
-        planned_at = now + timedelta(milliseconds=self.settings.simulated_execution_delay_ms)
+        reval_delay = self.settings.mr_revalidation_delay_sec
+        effective_delay_sec = reval_delay if reval_delay > 0 else self.settings.simulated_execution_delay_ms / 1000.0
+        planned_at = now + timedelta(seconds=effective_delay_sec)
         task = asyncio.create_task(self._execute_after_delay(symbol), name=f"mr-entry-{symbol}")
         self.pending_entries_by_symbol[symbol] = PendingMrEntry(
             symbol=symbol,
@@ -715,7 +717,15 @@ class MeanReversionEngine:
                     current_spread_pct, reval_floor, current.signal_spread_pct, delay_sec,
                 )
                 return
-            threshold = current.rolling_mean + (self.settings.mr_sigma_entry * current.rolling_std)
+            # Re-fetch baseline (may have shifted during delay)
+            key = (symbol, current.long_exchange, current.short_exchange)
+            baseline = self.baselines.get(key)
+            if baseline is None or not baseline.is_ready:
+                return
+            reval_mean = baseline.mean
+            reval_std = baseline.std
+
+            threshold = reval_mean + (self.settings.mr_sigma_entry * reval_std)
             if current_spread_pct <= threshold:
                 return
             roundtrip_cost_pct = _roundtrip_cost_pct(
@@ -724,7 +734,7 @@ class MeanReversionEngine:
                 slippage_buffer_pct=self.settings.slippage_buffer_pct,
                 safety_buffer_pct=self.settings.safety_buffer_pct,
             )
-            expected_edge_pct = current_spread_pct - current.rolling_mean
+            expected_edge_pct = current_spread_pct - reval_mean
             net_edge_pct = expected_edge_pct - roundtrip_cost_pct
             if net_edge_pct < self.settings.mr_min_net_edge_pct:
                 return
@@ -746,11 +756,11 @@ class MeanReversionEngine:
             )
 
             sigma_at_entry = _sigma_from(
-                mean=current.rolling_mean,
-                std=current.rolling_std,
+                mean=reval_mean,
+                std=reval_std,
                 spread_pct=current_spread_pct,
             )
-            edge_at_entry = current_spread_pct - current.rolling_mean
+            edge_at_entry = current_spread_pct - reval_mean
             take_profit_target = current_spread_pct - (edge_at_entry * self.settings.mr_take_profit_fraction)
             long_stop_id = ""
             short_stop_id = ""
@@ -801,8 +811,8 @@ class MeanReversionEngine:
                 entry_long_price=entry_long_price,
                 entry_short_price=entry_short_price,
                 entry_spread_pct=current_spread_pct,
-                entry_rolling_mean=current.rolling_mean,
-                entry_rolling_std=current.rolling_std,
+                entry_rolling_mean=reval_mean,
+                entry_rolling_std=reval_std,
                 sigma_at_entry=sigma_at_entry,
                 take_profit_target=take_profit_target,
                 max_adverse_spread_pct=current_spread_pct,

@@ -64,35 +64,57 @@ def main() -> None:
     # (the collector uses a fixed threshold, the bot uses rolling mean + sigma)
     # So we model: signal fires if peak >= X, and at 10s mark spread is still >= floor
 
+    # Step 1: load all events lasting > DELAY
     cur.execute("""
-        SELECT
-            e.id,
-            e.symbol,
-            e.long_exchange,
-            e.short_exchange,
-            e.entry_spread_pct,
-            e.peak_spread_pct,
-            e.exit_spread_pct,
-            e.mean_spread_pct,
-            e.duration_ms,
-            e.simulated_net_pnl_pct,
-            e.threshold_pct,
-            e.num_samples,
-            t.spread_pct AS spread_at_delay,
-            t.elapsed_ms AS tick_elapsed_ms
-        FROM spread_events e
-        LEFT JOIN spread_ticks t ON t.event_id = e.id
-            AND t.elapsed_ms = (
-                SELECT t2.elapsed_ms FROM spread_ticks t2
-                WHERE t2.event_id = e.id
-                  AND t2.elapsed_ms BETWEEN ? AND ?
-                ORDER BY ABS(t2.elapsed_ms - ?) LIMIT 1
-            )
-        WHERE e.duration_ms > ? * 1000
-    """, (DELAY_MS_LO, DELAY_MS_HI, DELAY_SEC * 1000, DELAY_SEC))
+        SELECT id, symbol, long_exchange, short_exchange,
+               entry_spread_pct, peak_spread_pct, exit_spread_pct,
+               mean_spread_pct, duration_ms, simulated_net_pnl_pct,
+               threshold_pct, num_samples
+        FROM spread_events
+        WHERE duration_ms > ? * 1000
+    """, (DELAY_SEC,))
+    raw_events = cur.fetchall()
+    print(f"Events lasting > {DELAY_SEC}s: {len(raw_events)}")
 
-    events = cur.fetchall()
-    print(f"Events lasting > {DELAY_SEC}s (have tick at ~{DELAY_SEC}s): {len(events)}")
+    # Step 2: batch-load ticks near the delay mark
+    print("Loading ticks at ~10s mark...")
+    cur.execute("""
+        SELECT event_id, spread_pct, elapsed_ms
+        FROM spread_ticks
+        WHERE elapsed_ms BETWEEN ? AND ?
+    """, (DELAY_MS_LO, DELAY_MS_HI))
+    tick_rows = cur.fetchall()
+
+    # Pick closest tick to DELAY_SEC*1000 per event
+    best_tick: dict[int, tuple[float, int]] = {}
+    target_ms = DELAY_SEC * 1000
+    for tr in tick_rows:
+        eid, sp, ems = tr[0], tr[1], tr[2]
+        if eid not in best_tick or abs(ems - target_ms) < abs(best_tick[eid][1] - target_ms):
+            best_tick[eid] = (sp, ems)
+
+    # Build final event list as dicts
+    events = []
+    for ev in raw_events:
+        eid = ev[0]
+        tick = best_tick.get(eid)
+        events.append({
+            "id": eid,
+            "symbol": ev[1],
+            "long_exchange": ev[2],
+            "short_exchange": ev[3],
+            "entry_spread_pct": ev[4],
+            "peak_spread_pct": ev[5],
+            "exit_spread_pct": ev[6],
+            "mean_spread_pct": ev[7],
+            "duration_ms": ev[8],
+            "simulated_net_pnl_pct": ev[9],
+            "threshold_pct": ev[10],
+            "num_samples": ev[11],
+            "spread_at_delay": tick[0] if tick else None,
+        })
+
+    print(f"Events with tick at ~{DELAY_SEC}s: {sum(1 for e in events if e['spread_at_delay'] is not None)}")
     print()
 
     # Model different filter scenarios
