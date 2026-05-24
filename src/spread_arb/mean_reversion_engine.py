@@ -575,6 +575,10 @@ class MeanReversionEngine:
 
         mean = baseline.mean
         std = baseline.std
+        # Skip structural spreads where mean is persistently high
+        max_mean = self.settings.mr_max_baseline_mean_pct
+        if max_mean > 0 and abs(mean) > max_mean:
+            return
         threshold = mean + (self.settings.mr_sigma_entry * std)
         if spread_pct <= threshold:
             return

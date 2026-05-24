@@ -82,6 +82,7 @@ class Settings(BaseSettings):
     mr_take_profit_fraction: float = Field(default=0.75, gt=0, le=1.0)
     mr_revalidation_delay_sec: float = Field(default=10.0, ge=0)
     mr_revalidation_min_spread_pct: float = Field(default=0.40, ge=0)
+    mr_max_baseline_mean_pct: float = Field(default=0.50, ge=0)
     mr_excluded_exchanges: list[str] = Field(default_factory=lambda: ["htx"])
     mr_quote_freshness_window: int = Field(default=30, ge=5)
     mr_min_quote_freshness_pct: float = Field(default=80.0, ge=0, le=100)
