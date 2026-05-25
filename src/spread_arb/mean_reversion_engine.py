@@ -571,33 +571,34 @@ class MeanReversionEngine:
             close_reason: str | None = None
             if current_spread_pct > stop_threshold:
                 close_reason = "stop_loss"
-            elif hold_seconds >= self.settings.mr_max_hold_seconds:
-                close_reason = "timeout"
             elif age_long_ms > exit_max_age_ms or age_short_ms > exit_max_age_ms:
                 close_reason = "stale_quote"
+            elif hold_seconds >= self.settings.mr_max_hold_seconds:
+                est_pnl = self._estimate_exit_pnl(position=position, long_quote=long_quote, short_quote=short_quote)
+                timeout_min_pnl = self.settings.mr_timeout_min_pnl_usdt
+                if est_pnl.net_pnl_usdt >= timeout_min_pnl:
+                    close_reason = "timeout"
+                elif hold_seconds >= self.settings.mr_timeout_max_hold_seconds:
+                    close_reason = "timeout_loss"
+                    self.log.warning(
+                        "mr timeout HARD | %s | est_pnl=%+.4f below threshold=%+.4f, forcing close (%.0fs/%.0fs)",
+                        symbol,
+                        est_pnl.net_pnl_usdt,
+                        timeout_min_pnl,
+                        hold_seconds,
+                        float(self.settings.mr_timeout_max_hold_seconds),
+                    )
+                else:
+                    self.log.debug(
+                        "mr timeout SOFT | %s | est_pnl=%+.4f below threshold=%+.4f, extending hold (%.0fs/%.0fs)",
+                        symbol,
+                        est_pnl.net_pnl_usdt,
+                        timeout_min_pnl,
+                        hold_seconds,
+                        float(self.settings.mr_timeout_max_hold_seconds),
+                    )
             elif current_spread_pct <= position.take_profit_target:
-                est_exit_long = float(long_quote.best_bid_price)
-                est_exit_short = float(short_quote.best_ask_price)
-                exit_fees = _one_side_fees_usdt(
-                    notional_usdt=position.notional_usdt,
-                    fee_long_pct=self._get_fee_pct(position.long_exchange),
-                    fee_short_pct=self._get_fee_pct(position.short_exchange),
-                )
-                exit_slippage = _one_side_slippage_usdt(
-                    notional_usdt=position.notional_usdt,
-                    slippage_buffer_pct=self.settings.slippage_buffer_pct,
-                )
-                est_pnl = calculate_pnl(
-                    notional_usdt=position.notional_usdt,
-                    entry_long_price=position.entry_long_price,
-                    entry_short_price=position.entry_short_price,
-                    exit_long_price=est_exit_long,
-                    exit_short_price=est_exit_short,
-                    entry_fees_usdt=position.estimated_entry_fees_usdt,
-                    exit_fees_usdt=exit_fees,
-                    entry_slippage_usdt=position.estimated_entry_slippage_usdt,
-                    exit_slippage_usdt=exit_slippage,
-                )
+                est_pnl = self._estimate_exit_pnl(position=position, long_quote=long_quote, short_quote=short_quote)
                 if est_pnl.net_pnl_usdt > 0:
                     close_reason = "mean_reversion"
                 else:
@@ -614,6 +615,36 @@ class MeanReversionEngine:
                     long_quote=long_quote,
                     short_quote=short_quote,
                 )
+
+    def _estimate_exit_pnl(
+        self,
+        *,
+        position: MeanRevPosition,
+        long_quote: Quote,
+        short_quote: Quote,
+    ):
+        est_exit_long = float(long_quote.best_bid_price)
+        est_exit_short = float(short_quote.best_ask_price)
+        exit_fees = _one_side_fees_usdt(
+            notional_usdt=position.notional_usdt,
+            fee_long_pct=self._get_fee_pct(position.long_exchange),
+            fee_short_pct=self._get_fee_pct(position.short_exchange),
+        )
+        exit_slippage = _one_side_slippage_usdt(
+            notional_usdt=position.notional_usdt,
+            slippage_buffer_pct=self.settings.slippage_buffer_pct,
+        )
+        return calculate_pnl(
+            notional_usdt=position.notional_usdt,
+            entry_long_price=position.entry_long_price,
+            entry_short_price=position.entry_short_price,
+            exit_long_price=est_exit_long,
+            exit_short_price=est_exit_short,
+            entry_fees_usdt=position.estimated_entry_fees_usdt,
+            exit_fees_usdt=exit_fees,
+            entry_slippage_usdt=position.estimated_entry_slippage_usdt,
+            exit_slippage_usdt=exit_slippage,
+        )
 
     def _schedule_close(
         self,
@@ -732,6 +763,28 @@ class MeanReversionEngine:
         if spread_pct <= threshold:
             return
 
+        required_signal_notional = self.settings.mr_notional_usdt
+        if self.live_mode and self.settings.mr_compound_enabled:
+            required_signal_notional = self.settings.mr_min_notional_usdt
+        long_top_capacity = float(long_quote.best_ask_price * long_quote.best_ask_size)
+        short_top_capacity = float(short_quote.best_bid_price * short_quote.best_bid_size)
+        min_top_capacity = min(long_top_capacity, short_top_capacity)
+        liquidity_multiplier = self.settings.mr_min_top_capacity_multiplier
+        if max_bbo_bps > 0 and max(long_bbo_bps, short_bbo_bps) > (max_bbo_bps / 2.0):
+            liquidity_multiplier *= 2.0
+        required_top_capacity = liquidity_multiplier * required_signal_notional
+        if min_top_capacity < required_top_capacity:
+            self.log.debug(
+                "mr filter LIQUIDITY | %s | top_capacity=$%.0f < %.1fx notional ($%.0f required) | bbo=%.1f/%.1f bps",
+                symbol,
+                min_top_capacity,
+                liquidity_multiplier,
+                required_top_capacity,
+                long_bbo_bps,
+                short_bbo_bps,
+            )
+            return
+
         sigma = _sigma_from(mean=mean, std=std, spread_pct=spread_pct)
         roundtrip_cost_pct = _roundtrip_cost_pct(
             fee_long_pct=self._get_fee_pct(long_exchange),
@@ -739,13 +792,14 @@ class MeanReversionEngine:
             slippage_buffer_pct=self.settings.slippage_buffer_pct,
             safety_buffer_pct=self.settings.safety_buffer_pct,
         )
+        bbo_walk_pct = _bbo_walk_pct(long_quote=long_quote, short_quote=short_quote)
         expected_edge_pct = spread_pct - mean
-        net_edge_pct = expected_edge_pct - roundtrip_cost_pct
+        net_edge_pct = expected_edge_pct - roundtrip_cost_pct - bbo_walk_pct
 
         long_fresh_pct = self._get_freshness_pct(long_exchange, symbol)
         short_fresh_pct = self._get_freshness_pct(short_exchange, symbol)
         self.log.info(
-            "mr signal | %s %s->%s | spread=%+.4f%% | mean=%+.4f%% | std=%.4f%% | sigma=%.2f | net_edge=%+.4f%% | fresh=%.0f%%/%.0f%% | bbo=%.1f/%.1f",
+            "mr signal | %s %s->%s | spread=%+.4f%% | mean=%+.4f%% | std=%.4f%% | sigma=%.2f | net_edge=%+.4f%% | bbo_walk=%.4f%% | fresh=%.0f%%/%.0f%% | bbo=%.1f/%.1f",
             symbol,
             long_exchange.value,
             short_exchange.value,
@@ -754,6 +808,7 @@ class MeanReversionEngine:
             std,
             sigma,
             net_edge_pct,
+            bbo_walk_pct,
             long_fresh_pct,
             short_fresh_pct,
             long_bbo_bps,
@@ -777,14 +832,6 @@ class MeanReversionEngine:
         age_long_ms = (now - long_quote.received_at).total_seconds() * 1000.0
         age_short_ms = (now - short_quote.received_at).total_seconds() * 1000.0
         if age_long_ms > self.settings.max_quote_age_ms or age_short_ms > self.settings.max_quote_age_ms:
-            return
-
-        long_capacity = float(long_quote.best_ask_price * long_quote.best_ask_size)
-        short_capacity = float(short_quote.best_bid_price * short_quote.best_bid_size)
-        required_signal_notional = self.settings.mr_notional_usdt
-        if self.live_mode and self.settings.mr_compound_enabled:
-            required_signal_notional = self.settings.mr_min_notional_usdt
-        if long_capacity < required_signal_notional or short_capacity < required_signal_notional:
             return
 
         reval_delay = self.settings.mr_revalidation_delay_sec
@@ -852,9 +899,32 @@ class MeanReversionEngine:
             else:
                 notional = self.settings.mr_notional_usdt
 
-            long_capacity = float(long_quote.best_ask_price * long_quote.best_ask_size)
-            short_capacity = float(short_quote.best_bid_price * short_quote.best_bid_size)
-            if long_capacity < notional or short_capacity < notional:
+            long_top_capacity = float(long_quote.best_ask_price * long_quote.best_ask_size)
+            short_top_capacity = float(short_quote.best_bid_price * short_quote.best_bid_size)
+            min_top_capacity = min(long_top_capacity, short_top_capacity)
+            reval_long_bbo_bps = float(
+                (long_quote.best_ask_price - long_quote.best_bid_price) / long_quote.best_bid_price
+            ) * 10_000
+            reval_short_bbo_bps = float(
+                (short_quote.best_ask_price - short_quote.best_bid_price) / short_quote.best_bid_price
+            ) * 10_000
+            max_bbo_bps = self.settings.mr_max_bbo_spread_bps
+            liquidity_multiplier = self.settings.mr_min_top_capacity_multiplier
+            if max_bbo_bps > 0 and max(reval_long_bbo_bps, reval_short_bbo_bps) > (max_bbo_bps / 2.0):
+                liquidity_multiplier *= 2.0
+            required_top_capacity = liquidity_multiplier * notional
+            if min_top_capacity < required_top_capacity:
+                self.log.info(
+                    "mr reval REJECT LIQUIDITY | %s %s->%s | top_capacity=$%.0f < %.1fx notional ($%.0f required) | bbo=%.1f/%.1f bps",
+                    symbol,
+                    current.long_exchange.value,
+                    current.short_exchange.value,
+                    min_top_capacity,
+                    liquidity_multiplier,
+                    required_top_capacity,
+                    reval_long_bbo_bps,
+                    reval_short_bbo_bps,
+                )
                 return
 
             current_spread_pct = _directional_spread_pct(
@@ -887,15 +957,16 @@ class MeanReversionEngine:
                 slippage_buffer_pct=self.settings.slippage_buffer_pct,
                 safety_buffer_pct=self.settings.safety_buffer_pct,
             )
+            bbo_walk_pct = _bbo_walk_pct(long_quote=long_quote, short_quote=short_quote)
             expected_edge_pct = current_spread_pct - reval_mean
-            net_edge_pct = expected_edge_pct - roundtrip_cost_pct
+            net_edge_pct = expected_edge_pct - roundtrip_cost_pct - bbo_walk_pct
             if net_edge_pct < self.settings.mr_min_net_edge_pct:
                 return
 
             self.log.info(
-                "mr reval CONFIRMED | %s %s->%s | spread=%.4f%% (was %.4f%%) | survived %.1fs delay | net_edge=%.4f%%",
+                "mr reval CONFIRMED | %s %s->%s | spread=%.4f%% (was %.4f%%) | survived %.1fs delay | net_edge=%.4f%% (bbo_walk=%.4f%%)",
                 symbol, current.long_exchange.value, current.short_exchange.value,
-                current_spread_pct, current.signal_spread_pct, delay_sec, net_edge_pct,
+                current_spread_pct, current.signal_spread_pct, delay_sec, net_edge_pct, bbo_walk_pct,
             )
 
             entry_fees_usdt = _one_side_fees_usdt(
@@ -1156,7 +1227,7 @@ class MeanReversionEngine:
         self.total_net_pnl_usdt += pnl.net_pnl_usdt
         self.close_reason_counts[close_reason] += 1
         self.symbol_pnl_usdt[position.symbol] += pnl.net_pnl_usdt
-        if close_reason == "mean_reversion" and pnl.net_pnl_usdt > 0:
+        if pnl.net_pnl_usdt > 0:
             self.winning_trades_count += 1
 
         self.last_closed_by_symbol[position.symbol] = now
@@ -1195,6 +1266,12 @@ def _one_side_fees_usdt(*, notional_usdt: float, fee_long_pct: float, fee_short_
 def _one_side_slippage_usdt(*, notional_usdt: float, slippage_buffer_pct: float) -> float:
     roundtrip_slippage = (2.0 * notional_usdt) * (slippage_buffer_pct / 100.0)
     return roundtrip_slippage / 2.0
+
+
+def _bbo_walk_pct(*, long_quote: Quote, short_quote: Quote) -> float:
+    long_bbo_pct = float((long_quote.best_ask_price - long_quote.best_bid_price) / long_quote.best_bid_price) * 100.0
+    short_bbo_pct = float((short_quote.best_ask_price - short_quote.best_bid_price) / short_quote.best_bid_price) * 100.0
+    return long_bbo_pct + short_bbo_pct
 
 
 def _sigma_from(*, mean: float, std: float, spread_pct: float) -> float:

@@ -77,6 +77,10 @@ class Settings(BaseSettings):
     mr_notional_pct: float = Field(default=85.0, gt=0, le=100)
     mr_min_notional_usdt: float = Field(default=5.0, ge=1)
     mr_max_hold_seconds: int = Field(default=900, ge=1)
+    # Smart exits and liquidity
+    mr_timeout_min_pnl_usdt: float = Field(default=0.005)
+    mr_timeout_max_hold_seconds: int = Field(default=1800, ge=60)
+    mr_min_top_capacity_multiplier: float = Field(default=3.0, gt=0)
     mr_cooldown_sec: int = Field(default=30, ge=0)
     mr_exit_max_quote_age_ms: int = Field(default=30_000, ge=1)
     mr_take_profit_fraction: float = Field(default=0.75, gt=0, le=1.0)
