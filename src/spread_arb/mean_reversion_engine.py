@@ -1284,6 +1284,3 @@ def _sigma_from(*, mean: float, std: float, spread_pct: float) -> float:
 
 def _direction_tag(*, long_exchange: ExchangeName, short_exchange: ExchangeName) -> str:
     return "ab" if long_exchange.value < short_exchange.value else "ba"
-
-: ExchangeName) -> str:
-    return "ab" if long_exchange.value < short_exchange.value else "ba"
