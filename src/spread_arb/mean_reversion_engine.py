@@ -114,11 +114,13 @@ class MeanReversionEngine:
         opportunity_store: OpportunityStore,
         get_latest_quote: Callable[[ExchangeName, str], Quote | None],
         execution_service: ExecutionService | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.settings = settings
         self.opportunity_store = opportunity_store
         self.get_latest_quote = get_latest_quote
         self.execution_service = execution_service
+        self._clock = clock or (lambda: datetime.now(UTC))
         self.log = logging.getLogger(__name__)
         self.live_mode = settings.live_trading and execution_service is not None
         if self.live_mode:
@@ -475,7 +477,7 @@ class MeanReversionEngine:
         return fee
 
     def update_baselines(self, snapshot_quotes: dict[tuple[ExchangeName, str], Quote]) -> None:
-        now = datetime.now(UTC)
+        now = self._clock()
         quotes_by_symbol: dict[str, dict[ExchangeName, Quote]] = {}
         for (exchange, symbol), quote in snapshot_quotes.items():
             quotes_by_symbol.setdefault(symbol, {})[exchange] = quote
@@ -536,7 +538,7 @@ class MeanReversionEngine:
         if not self.open_positions_by_symbol:
             return
 
-        now = datetime.now(UTC)
+        now = self._clock()
         exit_max_age_ms = self.settings.mr_exit_max_quote_age_ms
         tracking_fresh_max_age_ms = min(exit_max_age_ms, 5_000)
 
@@ -865,7 +867,7 @@ class MeanReversionEngine:
             if current is None:
                 return
 
-            now = datetime.now(UTC)
+            now = self._clock()
             if symbol in self.open_positions_by_symbol:
                 return
             if len(self.open_positions_by_symbol) >= self.settings.mr_max_positions:
@@ -1076,7 +1078,7 @@ class MeanReversionEngine:
         long_quote: Quote | None,
         short_quote: Quote | None,
     ) -> None:
-        now = datetime.now(UTC)
+        now = self._clock()
         if self.live_mode:
             if self.execution_service is None:
                 self.log.critical("LIVE exit failed | %s | missing execution service", position.symbol)
@@ -1281,4 +1283,7 @@ def _sigma_from(*, mean: float, std: float, spread_pct: float) -> float:
 
 
 def _direction_tag(*, long_exchange: ExchangeName, short_exchange: ExchangeName) -> str:
+    return "ab" if long_exchange.value < short_exchange.value else "ba"
+
+: ExchangeName) -> str:
     return "ab" if long_exchange.value < short_exchange.value else "ba"
