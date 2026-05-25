@@ -47,7 +47,7 @@ def _quote(
 def _build_engine(**kwargs: object) -> MeanReversionEngine:
     settings_kwargs: dict[str, object] = {
         "symbols": ["BTCUSDT"],
-        "mr_rolling_window": 3,
+        "mr_rolling_window": 30,
         "mr_min_net_edge_pct": 0.0,
     }
     settings_kwargs.update(kwargs)
@@ -96,7 +96,7 @@ def _build_position(opened_seconds_ago: int) -> MeanRevPosition:
 
 
 def test_timeout_pnl_guard_holds_position_in_loss() -> None:
-    engine = _build_engine(mr_max_hold_seconds=10, mr_timeout_max_hold_seconds=30, mr_timeout_min_pnl_usdt=0.0)
+    engine = _build_engine(mr_max_hold_seconds=10, mr_timeout_max_hold_seconds=60, mr_timeout_min_pnl_usdt=0.0)
     position = _build_position(opened_seconds_ago=15)
     engine.open_positions_by_symbol[position.symbol] = position
     close_reasons: list[str] = []
@@ -117,7 +117,7 @@ def test_timeout_pnl_guard_holds_position_in_loss() -> None:
 
 
 def test_timeout_pnl_guard_closes_on_breakeven() -> None:
-    engine = _build_engine(mr_max_hold_seconds=10, mr_timeout_max_hold_seconds=30, mr_timeout_min_pnl_usdt=0.0)
+    engine = _build_engine(mr_max_hold_seconds=10, mr_timeout_max_hold_seconds=60, mr_timeout_min_pnl_usdt=0.0)
     position = _build_position(opened_seconds_ago=15)
     engine.open_positions_by_symbol[position.symbol] = position
     close_reasons: list[str] = []
@@ -138,8 +138,8 @@ def test_timeout_pnl_guard_closes_on_breakeven() -> None:
 
 
 def test_timeout_hard_close_after_max_hold() -> None:
-    engine = _build_engine(mr_max_hold_seconds=10, mr_timeout_max_hold_seconds=30, mr_timeout_min_pnl_usdt=0.0)
-    position = _build_position(opened_seconds_ago=35)
+    engine = _build_engine(mr_max_hold_seconds=10, mr_timeout_max_hold_seconds=60, mr_timeout_min_pnl_usdt=0.0)
+    position = _build_position(opened_seconds_ago=70)
     engine.open_positions_by_symbol[position.symbol] = position
     close_reasons: list[str] = []
 
@@ -165,7 +165,7 @@ def test_liquidity_filter_rejects_thin_top_of_book() -> None:
         symbol="BTCUSDT",
         long_exchange=ExchangeName.BYBIT,
         short_exchange=ExchangeName.OKX,
-        samples=[0.2, 0.3, 0.4],
+        samples=[0.2, 0.3, 0.4] * 10,
     )
     now = datetime.now(UTC)
     long_quote = _quote(exchange=ExchangeName.BYBIT, symbol="BTCUSDT", bid="100.00", ask="100.03", bid_size="2", ask_size="2", received_at=now)
@@ -192,7 +192,7 @@ def test_liquidity_filter_doubles_multiplier_on_wide_bbo() -> None:
         symbol="BTCUSDT",
         long_exchange=ExchangeName.BYBIT,
         short_exchange=ExchangeName.OKX,
-        samples=[0.2, 0.3, 0.4],
+        samples=[0.2, 0.3, 0.4] * 10,
     )
     now = datetime.now(UTC)
     long_quote = _quote(exchange=ExchangeName.BYBIT, symbol="BTCUSDT", bid="100.00", ask="100.10", bid_size="4", ask_size="3.5", received_at=now)
@@ -227,7 +227,7 @@ def test_revalidation_rejects_thin_liquidity() -> None:
             symbol="BTCUSDT",
             long_exchange=ExchangeName.BYBIT,
             short_exchange=ExchangeName.OKX,
-            samples=[0.2, 0.3, 0.4],
+            samples=[0.2, 0.3, 0.4] * 10,
         )
         now = datetime.now(UTC)
         signal_long = _quote(
@@ -332,7 +332,7 @@ def test_bbo_walk_reduces_net_edge() -> None:
             symbol="BTCUSDT",
             long_exchange=ExchangeName.BYBIT,
             short_exchange=ExchangeName.OKX,
-            samples=[0.15, 0.2, 0.25],
+            samples=[0.15, 0.2, 0.25] * 10,
         )
         now = datetime.now(UTC)
         long_quote = _quote(exchange=ExchangeName.BYBIT, symbol="BTCUSDT", bid="100.00", ask="100.05", bid_size="12", ask_size="12", received_at=now)
