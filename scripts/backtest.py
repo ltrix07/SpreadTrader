@@ -22,24 +22,24 @@ from spread_arb.storage import PaperTradeRecord
 BASE_PARAMS: dict[str, float | int] = {
     "mr_sigma_entry": 2.0,
     "mr_min_net_edge_pct": 0.05,
-    "mr_revalidation_min_spread_pct": 0.20,
+    "mr_revalidation_min_spread_pct": 0.15,
     "mr_max_hold_seconds": 600,
-    "mr_max_bbo_spread_bps": 30.0,
-    "mr_max_baseline_mean_pct": 1.50,
+    "mr_max_bbo_spread_bps": 20.0,
+    "mr_max_baseline_mean_pct": 1.00,
     "mr_take_profit_fraction": 0.75,
     "mr_sigma_stop": 6.0,
     "mr_min_stop_distance_pct": 0.15,
 }
 
 SWEEPS: list[tuple[str, list[float | int]]] = [
-    ("mr_sigma_entry", [2.0, 2.5, 3.0, 3.5, 4.0]),
-    ("mr_min_net_edge_pct", [0.10, 0.20, 0.30, 0.40, 0.50]),
-    ("mr_revalidation_min_spread_pct", [0.40, 0.50, 0.60, 0.70, 0.80]),
-    ("mr_max_hold_seconds", [180, 300, 450, 600, 900]),
-    ("mr_max_bbo_spread_bps", [5.0, 8.0, 10.0, 15.0]),
-    ("mr_take_profit_fraction", [0.50, 0.60, 0.75, 0.85]),
-    ("mr_sigma_stop", [4.0, 5.0, 6.0, 8.0]),
-    ("mr_max_baseline_mean_pct", [0.30, 0.50, 0.70]),
+    ("mr_sigma_entry", [1.5, 2.0, 2.5, 3.0, 3.5]),
+    ("mr_min_net_edge_pct", [0.0, 0.05, 0.10, 0.20, 0.30]),
+    ("mr_revalidation_min_spread_pct", [0.0, 0.10, 0.20, 0.40, 0.60]),
+    ("mr_max_hold_seconds", [180, 300, 600, 900]),
+    ("mr_max_bbo_spread_bps", [10.0, 15.0, 25.0, 50.0]),
+    ("mr_take_profit_fraction", [0.40, 0.50, 0.60, 0.75, 0.85]),
+    ("mr_sigma_stop", [4.0, 6.0, 8.0]),
+    ("mr_max_baseline_mean_pct", [0.30, 0.50, 1.00, 2.00]),
 ]
 
 RESULT_COLUMNS = [
