@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import logging
 import math
 import sqlite3
 from dataclasses import dataclass
@@ -19,12 +20,12 @@ from spread_arb.models import ExchangeName, Quote
 from spread_arb.storage import PaperTradeRecord
 
 BASE_PARAMS: dict[str, float | int] = {
-    "mr_sigma_entry": 2.5,
-    "mr_min_net_edge_pct": 0.30,
-    "mr_revalidation_min_spread_pct": 0.60,
-    "mr_max_hold_seconds": 300,
-    "mr_max_bbo_spread_bps": 8.0,
-    "mr_max_baseline_mean_pct": 0.50,
+    "mr_sigma_entry": 2.0,
+    "mr_min_net_edge_pct": 0.05,
+    "mr_revalidation_min_spread_pct": 0.20,
+    "mr_max_hold_seconds": 600,
+    "mr_max_bbo_spread_bps": 30.0,
+    "mr_max_baseline_mean_pct": 1.50,
     "mr_take_profit_fraction": 0.75,
     "mr_sigma_stop": 6.0,
     "mr_min_stop_distance_pct": 0.15,
@@ -499,7 +500,8 @@ async def _run_single_backtest(
     print(
         f"[run {run_id:02d}] sweep={sweep_name} {param_name}={param_value} "
         f"ticks={tick_count} trades={metrics['trade_count']} net={float(metrics['total_net_pnl_usdt']):+.2f} "
-        f"wr={float(metrics['winrate']):.2f} score={float(metrics['score']):+.3f}"
+        f"wr={float(metrics['winrate']):.2f} score={float(metrics['score']):+.3f} "
+        f"baselines_ready={len(engine.baseline_ready_keys)}/{len(engine.baselines)}"
     )
     return BacktestRun(
         run_id=run_id,
@@ -531,11 +533,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--until", required=True, help="End date/datetime (exclusive; date means next day 00:00 UTC)")
     parser.add_argument("--symbols", default="env", help="'all', 'env', or comma-separated symbols")
     parser.add_argument("--output", default="backtest_results.csv", help="Output CSV path")
+    parser.add_argument("--debug", action="store_true", help="Enable DEBUG log level (shows mr signal/filter/reval messages)")
+    parser.add_argument("--baseline-only", action="store_true", help="Only run baseline (skip sweeps) - for diagnostics")
     return parser
 
 
 async def _run() -> None:
     args = _build_parser().parse_args()
+    if args.debug:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+        )
     db_path = Path(args.db)
     if not db_path.exists():
         raise SystemExit(f"Database not found: {db_path}")
@@ -583,6 +592,14 @@ async def _run() -> None:
         )
         all_runs.append(baseline)
         run_id += 1
+
+        if args.baseline_only:
+            print("baseline-only mode, skipping sweeps")
+            output_path = Path(args.output)
+            _write_results(output_path, all_runs)
+            _write_best_breakdowns(trades=baseline.trades, output_path=output_path)
+            print(f"\nResults CSV: {output_path}")
+            return
 
         for sweep_name, values in SWEEPS:
             sweep_runs: list[BacktestRun] = []
