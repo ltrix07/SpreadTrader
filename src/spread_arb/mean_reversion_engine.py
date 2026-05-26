@@ -11,7 +11,7 @@ from typing import Callable
 
 from .config import Settings
 from .execution import ExecutionError, ExecutionService
-from .models import ExchangeName, Quote
+from .models import ExchangeName, FundingInfo, Quote
 from .paper_engine import calculate_pnl
 from .storage import OpportunityStore, PaperTradeRecord
 
@@ -165,6 +165,8 @@ class MeanReversionEngine:
             ExchangeName.BITGET: self.settings.taker_fee_bitget_pct,
             ExchangeName.HTX: self.settings.taker_fee_htx_pct,
         }
+        self._funding_cache: dict[tuple[ExchangeName, str], tuple[FundingInfo, datetime]] = {}
+        self._funding_cache_ttl_sec: float = 60.0
 
     def preload_baselines(self, database_url: str) -> None:
         """Load recent spread snapshots from DB to pre-populate rolling baselines."""
@@ -475,6 +477,30 @@ class MeanReversionEngine:
             )
             return self._FALLBACK_FEE_PCT
         return fee
+
+    async def _get_funding_info(self, exchange: ExchangeName, symbol: str) -> FundingInfo | None:
+        """Get funding info with a short cache. Returns None if fetch fails."""
+        cache_key = (exchange, symbol)
+        now = self._clock()
+        cached = self._funding_cache.get(cache_key)
+        if cached is not None:
+            info, fetched_at = cached
+            if (now - fetched_at).total_seconds() < self._funding_cache_ttl_sec:
+                return info
+
+        if self.execution_service is None:
+            return None
+        client = self.execution_service.clients.get(exchange)
+        if client is None:
+            return None
+        try:
+            info = await client.get_funding_info(symbol)
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("funding fetch failed | %s %s | %s", exchange.value, symbol, exc)
+            return None
+
+        self._funding_cache[cache_key] = (info, now)
+        return info
 
     def update_baselines(self, snapshot_quotes: dict[tuple[ExchangeName, str], Quote]) -> None:
         now = self._clock()
@@ -965,6 +991,37 @@ class MeanReversionEngine:
             if net_edge_pct < self.settings.mr_min_net_edge_pct:
                 return
 
+            if self.live_mode and self.settings.mr_funding_filter_enabled:
+                expected_hold_sec = self.settings.mr_max_hold_seconds
+                max_funding_cost_pct = expected_edge_pct * self.settings.mr_funding_max_cost_fraction
+
+                long_funding = await self._get_funding_info(current.long_exchange, symbol)
+                short_funding = await self._get_funding_info(current.short_exchange, symbol)
+                if long_funding is not None and short_funding is not None:
+                    expected_cost_pct = _estimate_net_funding_cost_pct(
+                        long_funding=long_funding,
+                        short_funding=short_funding,
+                        position_direction=current.direction,
+                        now=now,
+                        hold_seconds=expected_hold_sec,
+                    )
+                    if expected_cost_pct > max_funding_cost_pct:
+                        self.log.info(
+                            "mr reval REJECT FUNDING | %s %s->%s | expected_cost=%.4f%% > max=%.4f%% (edge=%.4f%%) | "
+                            "long_rate=%.4f%% next=%s | short_rate=%.4f%% next=%s",
+                            symbol,
+                            current.long_exchange.value,
+                            current.short_exchange.value,
+                            expected_cost_pct,
+                            max_funding_cost_pct,
+                            expected_edge_pct,
+                            float(long_funding.funding_rate * 100),
+                            long_funding.next_funding_time.isoformat()[:19],
+                            float(short_funding.funding_rate * 100),
+                            short_funding.next_funding_time.isoformat()[:19],
+                        )
+                        return
+
             self.log.info(
                 "mr reval CONFIRMED | %s %s->%s | spread=%.4f%% (was %.4f%%) | survived %.1fs delay | net_edge=%.4f%% (bbo_walk=%.4f%%)",
                 symbol, current.long_exchange.value, current.short_exchange.value,
@@ -1249,6 +1306,35 @@ class MeanReversionEngine:
 
 def _directional_spread_pct(*, ask_long: Decimal, bid_short: Decimal) -> float:
     return float((bid_short - ask_long) / ask_long * Decimal("100"))
+
+
+def _estimate_net_funding_cost_pct(
+    *,
+    long_funding: FundingInfo,
+    short_funding: FundingInfo,
+    position_direction: str,
+    now: datetime,
+    hold_seconds: int,
+) -> float:
+    """Estimate net funding cost in percent over the hold window (positive means we pay)."""
+    _ = position_direction
+    hold_end = now + timedelta(seconds=hold_seconds)
+
+    def _payments_in_window(funding: FundingInfo) -> int:
+        count = 0
+        next_t = funding.next_funding_time
+        interval = timedelta(hours=funding.funding_interval_hours)
+        while next_t <= hold_end:
+            if next_t > now:
+                count += 1
+            next_t += interval
+        return count
+
+    n_long = _payments_in_window(long_funding)
+    n_short = _payments_in_window(short_funding)
+    long_cost_pct = float(long_funding.funding_rate) * 100.0 * n_long
+    short_gain_pct = float(short_funding.funding_rate) * 100.0 * n_short
+    return long_cost_pct - short_gain_pct
 
 
 def _roundtrip_cost_pct(

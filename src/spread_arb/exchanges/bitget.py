@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from urllib.parse import urlencode
 
-from ..models import BalanceInfo, ExchangeName, OrderResult, PositionInfo, Quote, Symbol
+from ..models import BalanceInfo, ExchangeName, FundingInfo, OrderResult, PositionInfo, Quote, Symbol
 from .base import ExchangeClient
 from .signing import hmac_sha256_base64, timestamp_ms
 
@@ -426,4 +426,65 @@ class BitgetExchange(ExchangeClient):
                 "productType": "USDT-FUTURES",
                 "marginCoin": "USDT",
             },
+        )
+
+    async def get_funding_info(self, symbol: str) -> FundingInfo:
+        bitget_symbol = self._to_bitget_symbol(symbol)
+        funding_time_endpoint = f"{self.base_url}/api/v2/mix/market/funding-time"
+        fund_rate_endpoint = f"{self.base_url}/api/v2/mix/market/current-fund-rate"
+        params = {"productType": "usdt-futures", "symbol": bitget_symbol}
+
+        async with self.session.get(
+            funding_time_endpoint,
+            params=params,
+            timeout=self.request_timeout_sec,
+        ) as response:
+            response.raise_for_status()
+            funding_time_payload = await response.json()
+
+        if funding_time_payload.get("code") != "00000":
+            raise RuntimeError(f"Bitget funding-time API error: {funding_time_payload}")
+        funding_time_data = funding_time_payload.get("data", {})
+        funding_time_item = (
+            funding_time_data[0] if isinstance(funding_time_data, list) else funding_time_data
+        )
+        if not isinstance(funding_time_item, dict):
+            raise RuntimeError(f"Bitget funding-time malformed response: {funding_time_payload}")
+
+        async with self.session.get(
+            fund_rate_endpoint,
+            params=params,
+            timeout=self.request_timeout_sec,
+        ) as response:
+            response.raise_for_status()
+            fund_rate_payload = await response.json()
+
+        if fund_rate_payload.get("code") != "00000":
+            raise RuntimeError(f"Bitget funding-rate API error: {fund_rate_payload}")
+        fund_rate_data = fund_rate_payload.get("data", {})
+        fund_rate_item = fund_rate_data[0] if isinstance(fund_rate_data, list) else fund_rate_data
+        if not isinstance(fund_rate_item, dict):
+            raise RuntimeError(f"Bitget funding-rate malformed response: {fund_rate_payload}")
+
+        next_funding_raw = funding_time_item.get("nextFundingTime") or funding_time_item.get("fundingTime")
+        if next_funding_raw is None:
+            raise RuntimeError(f"Bitget funding-time response missing nextFundingTime: {funding_time_item}")
+        next_funding_time = datetime.fromtimestamp(int(str(next_funding_raw)) / 1000, tz=UTC)
+
+        interval_raw = (
+            funding_time_item.get("ratePeriod")
+            or fund_rate_item.get("fundingRateInterval")
+            or "8"
+        )
+        interval_str = str(interval_raw)
+        interval_digits = "".join(ch for ch in interval_str if ch.isdigit())
+        interval_hours = max(1, int(interval_digits or "8"))
+
+        return FundingInfo(
+            exchange=self.name,
+            symbol=symbol,
+            funding_rate=Decimal(str(fund_rate_item.get("fundingRate", "0"))),
+            next_funding_time=next_funding_time,
+            funding_interval_hours=interval_hours,
+            fetched_at=datetime.now(UTC),
         )

@@ -84,3 +84,15 @@ class BalanceInfo:
     exchange: ExchangeName
     total_usdt: Decimal
     available_usdt: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class FundingInfo:
+    """Current funding rate and next payment time for a symbol on an exchange."""
+
+    exchange: ExchangeName
+    symbol: str
+    funding_rate: Decimal
+    next_funding_time: datetime
+    funding_interval_hours: int
+    fetched_at: datetime

@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from aiohttp import ClientSession
 
-from ..models import BalanceInfo, ExchangeName, OrderResult, PositionInfo, Quote, Symbol
+from ..models import BalanceInfo, ExchangeName, FundingInfo, OrderResult, PositionInfo, Quote, Symbol
 
 QuoteCallback = Callable[[Quote], Awaitable[None] | None]
 
@@ -74,6 +74,10 @@ class ExchangeClient(ABC):
 
     async def get_balance(self) -> BalanceInfo:
         raise NotImplementedError(f"{self.name.value} does not support balance queries")
+
+    async def get_funding_info(self, symbol: str) -> FundingInfo:
+        """Return current funding rate and next funding payment time for a perp symbol."""
+        raise NotImplementedError(f"{self.name.value} does not support funding queries")
 
     async def get_min_order_qty(self, symbol: str) -> Decimal:
         raise NotImplementedError(f"{self.name.value} does not support min qty queries")

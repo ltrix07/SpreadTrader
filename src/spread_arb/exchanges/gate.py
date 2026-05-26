@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, ROUND_DOWN
 from urllib.parse import urlencode
 
-from ..models import BalanceInfo, ExchangeName, OrderResult, PositionInfo, Quote, Symbol
+from ..models import BalanceInfo, ExchangeName, FundingInfo, OrderResult, PositionInfo, Quote, Symbol
 from .base import ExchangeClient
 from .signing import hmac_sha512_hex, sha512_hex
 
@@ -466,3 +466,30 @@ class GateExchange(ExchangeClient):
             if self._is_not_found_error(exc):
                 return
             raise
+
+    async def get_funding_info(self, symbol: str) -> FundingInfo:
+        contract = self._to_gate_contract(symbol)
+        endpoint = f"{self.base_url}/api/v4/futures/usdt/contracts/{contract}"
+        async with self.session.get(endpoint, timeout=self.request_timeout_sec) as response:
+            response.raise_for_status()
+            payload = await response.json()
+
+        next_apply_raw = payload.get("funding_next_apply")
+        if next_apply_raw is None:
+            raise RuntimeError(f"Gate funding response missing funding_next_apply: {payload}")
+        next_funding_time = datetime.fromtimestamp(float(next_apply_raw), tz=UTC)
+
+        interval_sec_raw = payload.get("funding_interval")
+        if interval_sec_raw is None:
+            interval_hours = 8
+        else:
+            interval_hours = max(1, int(round(float(interval_sec_raw) / 3600.0)))
+
+        return FundingInfo(
+            exchange=self.name,
+            symbol=symbol,
+            funding_rate=Decimal(str(payload.get("funding_rate", "0"))),
+            next_funding_time=next_funding_time,
+            funding_interval_hours=interval_hours,
+            fetched_at=datetime.now(UTC),
+        )

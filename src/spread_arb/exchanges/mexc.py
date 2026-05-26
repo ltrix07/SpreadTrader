@@ -10,7 +10,7 @@ from urllib.parse import quote, urlencode
 
 from aiohttp import ContentTypeError
 
-from ..models import BalanceInfo, ExchangeName, OrderResult, PositionInfo, Quote, Symbol
+from ..models import BalanceInfo, ExchangeName, FundingInfo, OrderResult, PositionInfo, Quote, Symbol
 from .base import ExchangeClient
 from .signing import hmac_sha256_hex, timestamp_ms
 
@@ -536,3 +536,31 @@ class MexcExchange(ExchangeClient):
         detail = await self._contract_detail(symbol)
         min_vol = Decimal(str(detail.get("minVol", "1")))
         return await self._contracts_to_base_qty(symbol, min_vol)
+
+    async def get_funding_info(self, symbol: str) -> FundingInfo:
+        mexc_symbol = self._to_mexc_symbol(symbol)
+        endpoint = f"https://contract.mexc.com/api/v1/contract/funding_rate/{mexc_symbol}"
+        async with self.session.get(endpoint, timeout=self.request_timeout_sec) as response:
+            response.raise_for_status()
+            payload = await response.json()
+
+        if not payload.get("success", True):
+            raise RuntimeError(f"MEXC funding API error: {payload}")
+        data = payload.get("data", {})
+        if not isinstance(data, dict):
+            raise RuntimeError(f"MEXC funding response malformed: {payload}")
+
+        next_settle_raw = data.get("nextSettleTime")
+        if next_settle_raw is None:
+            raise RuntimeError(f"MEXC funding response missing nextSettleTime: {data}")
+        next_funding_time = datetime.fromtimestamp(int(str(next_settle_raw)) / 1000, tz=UTC)
+
+        interval_hours = max(1, int(str(data.get("collectCycle", 8))))
+        return FundingInfo(
+            exchange=self.name,
+            symbol=symbol,
+            funding_rate=Decimal(str(data.get("fundingRate", "0"))),
+            next_funding_time=next_funding_time,
+            funding_interval_hours=interval_hours,
+            fetched_at=datetime.now(UTC),
+        )

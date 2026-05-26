@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from urllib.parse import urlencode
 
-from ..models import BalanceInfo, ExchangeName, OrderResult, PositionInfo, Quote, Symbol
+from ..models import BalanceInfo, ExchangeName, FundingInfo, OrderResult, PositionInfo, Quote, Symbol
 from .base import ExchangeClient
 from .signing import hmac_sha256_hex, timestamp_ms
 
@@ -314,3 +314,33 @@ class BybitExchange(ExchangeClient):
 
         min_qty = Decimal(instruments[0]["lotSizeFilter"]["minOrderQty"])
         return self._to_canonical_qty(symbol, min_qty)
+
+    async def get_funding_info(self, symbol: str) -> FundingInfo:
+        bb_symbol = self._to_bybit_symbol(symbol)
+        endpoint = f"{self.base_url}/v5/market/tickers"
+        params = {"category": "linear", "symbol": bb_symbol}
+        async with self.session.get(endpoint, params=params, timeout=self.request_timeout_sec) as response:
+            response.raise_for_status()
+            payload = await response.json()
+
+        if payload.get("retCode") != 0:
+            raise RuntimeError(f"Bybit funding API error: {payload}")
+
+        tickers = payload.get("result", {}).get("list", [])
+        if not tickers:
+            raise RuntimeError(f"Bybit funding response missing ticker for {symbol}")
+        ticker = tickers[0]
+
+        next_funding_raw = ticker.get("nextFundingTime")
+        if next_funding_raw is None:
+            raise RuntimeError(f"Bybit funding response missing nextFundingTime: {ticker}")
+
+        next_funding_time = datetime.fromtimestamp(int(next_funding_raw) / 1000, tz=UTC)
+        return FundingInfo(
+            exchange=self.name,
+            symbol=symbol,
+            funding_rate=Decimal(str(ticker.get("fundingRate", "0"))),
+            next_funding_time=next_funding_time,
+            funding_interval_hours=8,
+            fetched_at=datetime.now(UTC),
+        )

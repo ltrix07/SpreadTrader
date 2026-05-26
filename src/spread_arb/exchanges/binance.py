@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from urllib.parse import urlencode
 
-from ..models import BalanceInfo, ExchangeName, OrderResult, PositionInfo, Quote, Symbol
+from ..models import BalanceInfo, ExchangeName, FundingInfo, OrderResult, PositionInfo, Quote, Symbol
 from .base import ExchangeClient
 from .signing import hmac_sha256_hex, timestamp_ms
 
@@ -256,3 +256,28 @@ class BinanceExchange(ExchangeClient):
                     if filter_info.get("filterType") == "LOT_SIZE":
                         return self._to_canonical_qty(symbol, Decimal(filter_info["minQty"]))
         raise RuntimeError(f"Min qty not found for {symbol}")
+
+    async def get_funding_info(self, symbol: str) -> FundingInfo:
+        bn_symbol = self._to_binance_symbol(symbol)
+        endpoint = f"{self.base_url}/fapi/v1/premiumIndex"
+        async with self.session.get(
+            endpoint,
+            params={"symbol": bn_symbol},
+            timeout=self.request_timeout_sec,
+        ) as response:
+            response.raise_for_status()
+            payload = await response.json()
+
+        next_funding_raw = payload.get("nextFundingTime")
+        if next_funding_raw is None:
+            raise RuntimeError(f"Binance funding response missing nextFundingTime: {payload}")
+
+        next_funding_time = datetime.fromtimestamp(int(next_funding_raw) / 1000, tz=UTC)
+        return FundingInfo(
+            exchange=self.name,
+            symbol=symbol,
+            funding_rate=Decimal(str(payload.get("lastFundingRate", "0"))),
+            next_funding_time=next_funding_time,
+            funding_interval_hours=8,
+            fetched_at=datetime.now(UTC),
+        )

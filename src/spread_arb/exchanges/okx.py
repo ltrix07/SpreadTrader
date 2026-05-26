@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, ROUND_DOWN
 from urllib.parse import urlencode
 
-from ..models import BalanceInfo, ExchangeName, OrderResult, PositionInfo, Quote, Symbol
+from ..models import BalanceInfo, ExchangeName, FundingInfo, OrderResult, PositionInfo, Quote, Symbol
 from .base import ExchangeClient
 from .signing import hmac_sha256_base64, timestamp_iso
 
@@ -348,3 +348,44 @@ class OkxExchange(ExchangeClient):
         meta = await self._instrument_meta(symbol)
         min_contracts = meta["minSz"]
         return await self._contracts_to_base_qty(symbol, min_contracts)
+
+    async def get_funding_info(self, symbol: str) -> FundingInfo:
+        inst_id = self._to_okx_inst_id(symbol)
+        endpoint = f"{self.base_url}/api/v5/public/funding-rate"
+        async with self.session.get(
+            endpoint,
+            params={"instId": inst_id},
+            timeout=self.request_timeout_sec,
+        ) as response:
+            response.raise_for_status()
+            payload = await response.json()
+
+        if payload.get("code") != "0":
+            raise RuntimeError(f"OKX funding API error: {payload}")
+        data = payload.get("data", [])
+        if not data:
+            raise RuntimeError(f"OKX funding response missing data for {symbol}")
+        item = data[0]
+
+        next_raw = item.get("nextFundingTime")
+        if next_raw is None:
+            raise RuntimeError(f"OKX funding response missing nextFundingTime: {item}")
+        next_ms = int(str(next_raw))
+        next_funding_time = datetime.fromtimestamp(next_ms / 1000, tz=UTC)
+
+        interval_hours = 8
+        funding_time_raw = item.get("fundingTime")
+        if funding_time_raw is not None:
+            funding_ms = int(str(funding_time_raw))
+            diff_ms = next_ms - funding_ms
+            if diff_ms > 0:
+                interval_hours = max(1, int(round(diff_ms / 3_600_000)))
+
+        return FundingInfo(
+            exchange=self.name,
+            symbol=symbol,
+            funding_rate=Decimal(str(item.get("fundingRate", "0"))),
+            next_funding_time=next_funding_time,
+            funding_interval_hours=interval_hours,
+            fetched_at=datetime.now(UTC),
+        )
