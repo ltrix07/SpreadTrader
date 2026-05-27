@@ -53,6 +53,7 @@ class BitgetExchange(ExchangeClient):
         )
         self.passphrase = passphrase
         self._pos_mode_cache: str | None = None
+        self._contract_meta_cache: dict[str, dict[str, Decimal]] = {}
 
     @property
     def name(self) -> ExchangeName:
@@ -75,6 +76,40 @@ class BitgetExchange(ExchangeClient):
         if not divisor:
             return qty
         return qty * Decimal(divisor)
+
+    async def _contract_rules(self, symbol: str) -> dict[str, Decimal]:
+        bitget_symbol = self._to_bitget_symbol(symbol)
+        cached = self._contract_meta_cache.get(bitget_symbol)
+        if cached is not None:
+            return cached
+
+        data = await self._signed_request(
+            "GET",
+            "/api/v2/mix/market/contracts?"
+            + urlencode({
+                "productType": "USDT-FUTURES",
+                "symbol": bitget_symbol,
+            }),
+        )
+
+        contracts = data if isinstance(data, list) else data.get("list") or []
+        if not contracts:
+            raise RuntimeError(f"Bitget contract metadata not found for {symbol}")
+
+        contract = contracts[0]
+        min_qty = Decimal(str(contract.get("minTradeNum") or "0"))
+        step_size = Decimal(str(contract.get("sizeMultiplier") or "0"))
+        if min_qty <= 0:
+            raise RuntimeError(f"Bitget minTradeNum missing for {symbol}")
+        if step_size <= 0:
+            raise RuntimeError(f"Bitget sizeMultiplier missing for {symbol}")
+
+        rules = {
+            "min_qty": self._to_canonical_qty(symbol, min_qty),
+            "step_size": self._to_canonical_qty(symbol, step_size),
+        }
+        self._contract_meta_cache[bitget_symbol] = rules
+        return rules
 
     async def fetch_quote(self, symbol: Symbol) -> Quote:
         started = time.perf_counter()
@@ -360,24 +395,65 @@ class BitgetExchange(ExchangeClient):
         )
 
     async def get_min_order_qty(self, symbol: str) -> Decimal:
+        return (await self._contract_rules(symbol))["min_qty"]
+
+    async def get_qty_step_size(self, symbol: str) -> Decimal:
+        return (await self._contract_rules(symbol))["step_size"]
+
+    async def get_trigger_fill_result(self, symbol: str, trigger_order_id: str) -> OrderResult | None:
         bitget_symbol = self._to_bitget_symbol(symbol)
-        data = await self._signed_request(
+        history = await self._signed_request(
             "GET",
-            "/api/v2/mix/market/contracts?"
+            "/api/v2/mix/order/orders-plan-history?"
             + urlencode({
-                "productType": "USDT-FUTURES",
+                "orderId": trigger_order_id,
+                "planType": "normal_plan",
                 "symbol": bitget_symbol,
+                "productType": "USDT-FUTURES",
             }),
         )
+        data = history if isinstance(history, dict) else {}
+        orders = data.get("entrustedList") or history if isinstance(history, list) else []
+        if not isinstance(orders, list) or not orders:
+            return None
 
-        contracts = data if isinstance(data, list) else data.get("list") or []
-        if not contracts:
-            raise RuntimeError(f"Bitget contract metadata not found for {symbol}")
+        plan_order = orders[0]
+        execute_order_id = str(plan_order.get("executeOrderId") or "")
+        detail: dict[str, object] = plan_order
+        if execute_order_id:
+            detail_path = "/api/v2/mix/order/detail?" + urlencode({
+                "symbol": bitget_symbol,
+                "productType": "USDT-FUTURES",
+                "orderId": execute_order_id,
+            })
+            detail_response = await self._signed_request("GET", detail_path)
+            if isinstance(detail_response, dict):
+                detail = detail_response
 
-        min_qty = Decimal(str(contracts[0].get("minTradeNum") or "0"))
-        if min_qty <= 0:
-            raise RuntimeError(f"Bitget minTradeNum missing for {symbol}")
-        return self._to_canonical_qty(symbol, min_qty)
+        avg_price = Decimal(str(detail.get("priceAvg") or plan_order.get("priceAvg") or "0"))
+        filled_qty = self._to_canonical_qty(
+            symbol,
+            Decimal(str(detail.get("baseVolume") or plan_order.get("baseVolume") or detail.get("size") or "0")),
+        )
+        if avg_price <= 0 or filled_qty <= 0:
+            return None
+
+        update_time_ms = int(str(detail.get("uTime") or plan_order.get("uTime") or detail.get("cTime") or plan_order.get("cTime") or timestamp_ms()))
+        side = str(detail.get("side") or plan_order.get("side") or "").lower()
+        state = str(detail.get("state") or plan_order.get("planStatus") or "").lower()
+        return OrderResult(
+            exchange=self.name,
+            symbol=symbol,
+            side=side,
+            filled_qty=filled_qty,
+            avg_price=avg_price,
+            fee=Decimal(str(detail.get("fee") or "0")).copy_abs(),
+            fee_currency="USDT",
+            order_id=execute_order_id or str(detail.get("orderId") or trigger_order_id),
+            timestamp=datetime.fromtimestamp(update_time_ms / 1000, tz=UTC),
+            is_partial=state not in {"filled", "executed"},
+            raw_response=detail,
+        )
 
     async def place_stop_market_order(
         self,

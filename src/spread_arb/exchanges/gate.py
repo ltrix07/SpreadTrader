@@ -84,19 +84,17 @@ class GateExchange(ExchangeClient):
         received_at = datetime.now(UTC)
 
         bid_price = Decimal(str(best_bid["p"]))
-        bid_size = Decimal(str(best_bid["s"]))
+        bid_size = await self.book_size_to_base_qty(symbol, Decimal(str(best_bid["s"])))
         ask_price = Decimal(str(best_ask["p"]))
-        ask_size = Decimal(str(best_ask["s"]))
+        ask_size = await self.book_size_to_base_qty(symbol, Decimal(str(best_ask["s"])))
 
-        # Gate sizes are in contracts; for most USDT pairs 1 contract = 1 unit.
-        # Normalise 1000-prefix symbols.
+        # Gate prices need canonical 1000-prefix normalization, but sizes are
+        # already converted into canonical base units via contract metadata.
         multiplier = self._PRICE_MULTIPLIER.get(symbol)
         if multiplier:
             m = Decimal(multiplier)
             bid_price *= m
             ask_price *= m
-            bid_size /= m
-            ask_size /= m
 
         return Quote(
             received_at=received_at,
@@ -260,6 +258,9 @@ class GateExchange(ExchangeClient):
         underlying_qty = contracts * multiplier
         return underlying_qty / self._canonical_multiplier(symbol)
 
+    async def book_size_to_base_qty(self, symbol: str, contracts: Decimal) -> Decimal:
+        return await self._contracts_to_base_qty(symbol, contracts)
+
     async def _fetch_order_detail_with_retry(
         self,
         order_id: str,
@@ -358,6 +359,45 @@ class GateExchange(ExchangeClient):
         if min_contracts <= 0:
             min_contracts = Decimal("1")
         return await self._contracts_to_base_qty(symbol, min_contracts)
+
+    async def get_qty_step_size(self, symbol: str) -> Decimal:
+        return await self._contracts_to_base_qty(symbol, Decimal("1"))
+
+    async def get_trigger_fill_result(self, symbol: str, trigger_order_id: str) -> OrderResult | None:
+        trigger_detail = await self._signed_request("GET", f"/api/v4/futures/usdt/price_orders/{trigger_order_id}")
+        if not isinstance(trigger_detail, dict):
+            return None
+
+        fired_order_id = (
+            trigger_detail.get("fired_order_id")
+            or trigger_detail.get("firedOrderId")
+            or trigger_detail.get("order_id")
+        )
+        if not fired_order_id:
+            return None
+
+        detail_raw = await self._signed_request("GET", f"/api/v4/futures/usdt/orders/{fired_order_id}")
+        detail = detail_raw if isinstance(detail_raw, dict) else {}
+        filled_contracts = self._extract_filled_contracts(detail, Decimal("0"))
+        avg_price = self._extract_avg_price(detail)
+        if filled_contracts <= 0 or avg_price <= 0:
+            return None
+
+        return OrderResult(
+            exchange=self.name,
+            symbol=symbol,
+            side=str(detail.get("size", "0")).startswith("-") and "sell" or "buy",
+            filled_qty=await self._contracts_to_base_qty(symbol, filled_contracts),
+            avg_price=avg_price,
+            fee=Decimal(str(detail.get("fee") or "0")).copy_abs(),
+            fee_currency=str(detail.get("fee_currency") or "USDT"),
+            order_id=str(detail.get("id") or fired_order_id),
+            timestamp=self._timestamp_to_datetime(
+                detail.get("finish_time") or detail.get("update_time") or detail.get("create_time"),
+            ),
+            is_partial=str(detail.get("finish_as") or "").lower() != "filled",
+            raw_response=detail,
+        )
 
     async def place_market_order(
         self,

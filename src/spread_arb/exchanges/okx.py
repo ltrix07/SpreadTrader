@@ -103,17 +103,15 @@ class OkxExchange(ExchangeClient):
         )
 
         bid_price = Decimal(str(best_bid[0]))
-        bid_size = Decimal(str(best_bid[1]))
+        bid_size = await self.book_size_to_base_qty(symbol, Decimal(str(best_bid[1])))
         ask_price = Decimal(str(best_ask[0]))
-        ask_size = Decimal(str(best_ask[1]))
+        ask_size = await self.book_size_to_base_qty(symbol, Decimal(str(best_ask[1])))
 
         multiplier = self._PRICE_MULTIPLIER.get(symbol)
         if multiplier:
             m = Decimal(multiplier)
             bid_price *= m
             ask_price *= m
-            bid_size /= m
-            ask_size /= m
 
         return Quote(
             received_at=received_at,
@@ -198,6 +196,9 @@ class OkxExchange(ExchangeClient):
         ct_val = meta["ctVal"]
         underlying_qty = contracts * ct_val
         return underlying_qty / self._canonical_multiplier(symbol)
+
+    async def book_size_to_base_qty(self, symbol: str, contracts: Decimal) -> Decimal:
+        return await self._contracts_to_base_qty(symbol, contracts)
 
     async def place_market_order(
         self,
@@ -348,6 +349,63 @@ class OkxExchange(ExchangeClient):
         meta = await self._instrument_meta(symbol)
         min_contracts = meta["minSz"]
         return await self._contracts_to_base_qty(symbol, min_contracts)
+
+    async def get_qty_step_size(self, symbol: str) -> Decimal:
+        meta = await self._instrument_meta(symbol)
+        return await self._contracts_to_base_qty(symbol, meta["lotSz"])
+
+    async def get_trigger_fill_result(self, symbol: str, trigger_order_id: str) -> OrderResult | None:
+        inst_id = self._to_okx_inst_id(symbol)
+        algo_details = await self._signed_request(
+            "GET",
+            "/api/v5/trade/orders-algo-history?"
+            + urlencode({
+                "ordType": "trigger",
+                "algoId": trigger_order_id,
+                "instType": "SWAP",
+                "instId": inst_id,
+            }),
+        )
+        algo_order = (algo_details[0] if isinstance(algo_details, list) and algo_details else {})
+        if not isinstance(algo_order, dict):
+            return None
+
+        ord_id = str(algo_order.get("ordId") or "")
+        if not ord_id:
+            return None
+
+        detail_path = f"/api/v5/trade/order?{urlencode({'instId': inst_id, 'ordId': ord_id})}"
+        details = await self._signed_request("GET", detail_path)
+        detail = details[0] if isinstance(details, list) and details else {}
+        if not detail:
+            details = await self._signed_request(
+                "GET",
+                "/api/v5/trade/orders-history?"
+                + urlencode({"instType": "SWAP", "instId": inst_id, "ordId": ord_id}),
+            )
+            detail = details[0] if isinstance(details, list) and details else {}
+        if not isinstance(detail, dict) or not detail:
+            return None
+
+        filled_contracts = Decimal(str(detail.get("accFillSz") or detail.get("fillSz") or "0"))
+        avg_price = Decimal(str(detail.get("avgPx") or detail.get("fillPx") or "0"))
+        if filled_contracts <= 0 or avg_price <= 0:
+            return None
+
+        ts_ms = int(detail.get("uTime") or detail.get("fillTime") or detail.get("cTime") or int(datetime.now(UTC).timestamp() * 1000))
+        return OrderResult(
+            exchange=self.name,
+            symbol=symbol,
+            side=str(detail.get("side") or "").lower(),
+            filled_qty=await self._contracts_to_base_qty(symbol, filled_contracts),
+            avg_price=avg_price,
+            fee=Decimal(str(detail.get("fee") or detail.get("fillFee") or "0")).copy_abs(),
+            fee_currency=str(detail.get("feeCcy") or "USDT"),
+            order_id=ord_id,
+            timestamp=datetime.fromtimestamp(ts_ms / 1000, tz=UTC),
+            is_partial=str(detail.get("state") or "").lower() != "filled",
+            raw_response={"algo_order": algo_order, "order_detail": detail},
+        )
 
     async def get_funding_info(self, symbol: str) -> FundingInfo:
         inst_id = self._to_okx_inst_id(symbol)

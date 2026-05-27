@@ -32,6 +32,10 @@ class BybitExchange(ExchangeClient):
         "SHIBUSDT": 1000,
     }
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._instrument_cache: dict[str, dict[str, Decimal]] = {}
+
     @property
     def name(self) -> ExchangeName:
         return ExchangeName.BYBIT
@@ -53,6 +57,29 @@ class BybitExchange(ExchangeClient):
         if not divisor:
             return qty
         return qty * Decimal(divisor)
+
+    async def _lot_size_rules(self, symbol: str) -> dict[str, Decimal]:
+        bb_symbol = self._to_bybit_symbol(symbol)
+        cached = self._instrument_cache.get(bb_symbol)
+        if cached is not None:
+            return cached
+
+        data = await self._signed_request(
+            "GET",
+            "/v5/market/instruments-info",
+            {"category": "linear", "symbol": bb_symbol},
+        )
+        instruments = data.get("list") or []
+        if not instruments:
+            raise RuntimeError(f"Instrument not found for {symbol}")
+
+        lot_size_filter = instruments[0]["lotSizeFilter"]
+        rules = {
+            "min_qty": self._to_canonical_qty(symbol, Decimal(lot_size_filter["minOrderQty"])),
+            "step_size": self._to_canonical_qty(symbol, Decimal(lot_size_filter["qtyStep"])),
+        }
+        self._instrument_cache[bb_symbol] = rules
+        return rules
 
     async def fetch_quote(self, symbol: Symbol) -> Quote:
         started = time.perf_counter()
@@ -302,18 +329,48 @@ class BybitExchange(ExchangeClient):
         )
 
     async def get_min_order_qty(self, symbol: str) -> Decimal:
-        bb_symbol = self._to_bybit_symbol(symbol)
-        data = await self._signed_request(
-            "GET",
-            "/v5/market/instruments-info",
-            {"category": "linear", "symbol": bb_symbol},
-        )
-        instruments = data.get("list") or []
-        if not instruments:
-            raise RuntimeError(f"Instrument not found for {symbol}")
+        return (await self._lot_size_rules(symbol))["min_qty"]
 
-        min_qty = Decimal(instruments[0]["lotSizeFilter"]["minOrderQty"])
-        return self._to_canonical_qty(symbol, min_qty)
+    async def get_qty_step_size(self, symbol: str) -> Decimal:
+        return (await self._lot_size_rules(symbol))["step_size"]
+
+    async def get_trigger_fill_result(self, symbol: str, trigger_order_id: str) -> OrderResult | None:
+        bb_symbol = self._to_bybit_symbol(symbol)
+        history = await self._signed_request(
+            "GET",
+            "/v5/order/history",
+            {
+                "category": "linear",
+                "symbol": bb_symbol,
+                "orderId": trigger_order_id,
+                "orderFilter": "StopOrder",
+                "limit": "1",
+            },
+        )
+        orders = history.get("list") or []
+        if not orders:
+            return None
+
+        order_info = orders[0]
+        avg_price = Decimal(order_info.get("avgPrice") or "0")
+        filled_qty = self._to_canonical_qty(symbol, Decimal(order_info.get("cumExecQty", "0")))
+        if avg_price <= 0 or filled_qty <= 0:
+            return None
+
+        updated_time_ms = int(order_info.get("updatedTime") or order_info.get("createdTime") or timestamp_ms())
+        return OrderResult(
+            exchange=self.name,
+            symbol=symbol,
+            side=str(order_info.get("side") or "").lower(),
+            filled_qty=filled_qty,
+            avg_price=avg_price,
+            fee=Decimal(order_info.get("cumExecFee", "0")).copy_abs(),
+            fee_currency="USDT",
+            order_id=str(order_info.get("orderId") or trigger_order_id),
+            timestamp=datetime.fromtimestamp(updated_time_ms / 1000, tz=UTC),
+            is_partial=str(order_info.get("orderStatus") or "") != "Filled",
+            raw_response=order_info,
+        )
 
     async def get_funding_info(self, symbol: str) -> FundingInfo:
         bb_symbol = self._to_bybit_symbol(symbol)

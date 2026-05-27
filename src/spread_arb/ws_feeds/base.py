@@ -82,12 +82,15 @@ class WebSocketFeed(ABC):
 
     async def subscribe_symbols(self, symbols: list[str]) -> None:
         """Subscribe to additional symbols on the live WS connection."""
-        if not symbols or self._ws is None or self._ws.closed:
+        if not symbols:
             return
         new_symbols = [s for s in symbols if s not in self.symbols]
         if not new_symbols:
             return
         self.symbols.extend(new_symbols)
+        if self._ws is None or self._ws.closed:
+            self.log.info("queued %d symbols for next reconnect: %s", len(new_symbols), new_symbols[:5])
+            return
         for msg in self._build_subscribe_messages_for(new_symbols):
             await self._ws.send_str(msg)
             await asyncio.sleep(0.1)
@@ -95,7 +98,7 @@ class WebSocketFeed(ABC):
 
     async def unsubscribe_symbols(self, symbols: list[str]) -> None:
         """Unsubscribe from symbols on the live WS connection."""
-        if not symbols or self._ws is None or self._ws.closed:
+        if not symbols:
             return
         existing = set(self.symbols)
         remove_symbols = [s for s in symbols if s in existing]
@@ -103,6 +106,9 @@ class WebSocketFeed(ABC):
             return
         symbols_set = set(remove_symbols)
         self.symbols = [s for s in self.symbols if s not in symbols_set]
+        if self._ws is None or self._ws.closed:
+            self.log.info("removed %d queued symbols before reconnect: %s", len(remove_symbols), remove_symbols[:5])
+            return
         for msg in self._build_unsubscribe_messages_for(remove_symbols):
             await self._ws.send_str(msg)
             await asyncio.sleep(0.1)

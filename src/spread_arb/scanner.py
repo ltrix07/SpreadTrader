@@ -56,7 +56,9 @@ class QuoteScanner:
         self.mean_reversion_engine: MeanReversionEngine | None = None
         self.symbol_rotator: SymbolRotator | None = None
         self._ws_feeds: list[WebSocketFeed] = []
+        self._rest_poll_symbols: list[str] = list(self.settings.symbols)
         self.live_clients: dict[ExchangeName, ExchangeClient] = {}
+        self.exchange_clients_by_name: dict[ExchangeName, ExchangeClient] = {}
 
         self.exchange_fees_pct: dict[ExchangeName, float] = {
             ExchangeName.MEXC: self.settings.taker_fee_mexc_pct,
@@ -83,6 +85,7 @@ class QuoteScanner:
                     session,
                     credential_map=cred_map if self.settings.live_trading else None,
                 )
+                self.exchange_clients_by_name = {exchange.name: exchange for exchange in exchanges}
                 self.live_clients = {}
                 execution_service: ExecutionService | None = None
                 if self.settings.live_trading:
@@ -129,9 +132,10 @@ class QuoteScanner:
                         ) if self.mean_reversion_engine else 0,
                         on_symbols_changed=self._on_dynamic_symbols_changed,
                     )
+                self._reset_rest_poll_symbols()
 
                 if self.settings.use_websocket:
-                    data_tasks = self._start_ws_feeds(session)
+                    data_tasks = await self._start_ws_feeds(session)
                     # Start REST polls for exchanges without WS support.
                     rest_exchanges = [
                         ex for ex in exchanges
@@ -215,6 +219,7 @@ class QuoteScanner:
         self.opportunity_store = None
         self.mean_reversion_engine = None
         self.live_clients = {}
+        self.exchange_clients_by_name = {}
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -541,8 +546,6 @@ class QuoteScanner:
 
                 # Snapshot current quotes to avoid dict-changed-during-iteration.
                 snapshot_quotes = dict(self.latest_quotes)
-                if self.mean_reversion_engine is not None:
-                    self.mean_reversion_engine.update_baselines(snapshot_quotes)
 
                 # Group quotes by symbol.
                 quotes_by_symbol: dict[str, dict[ExchangeName, Quote]] = {}
@@ -604,6 +607,8 @@ class QuoteScanner:
                 if records:
                     inserted = self.opportunity_store.insert_spread_snapshots(records)
                     snapshot_count += inserted
+                    if self.mean_reversion_engine is not None:
+                        self.mean_reversion_engine.update_baselines(snapshot_quotes)
 
                 # Log progress every ~60 seconds (every 6th cycle).
                 if cycle_count % 6 == 0:
@@ -691,7 +696,7 @@ class QuoteScanner:
     def _ws_supported_exchanges(cls) -> set[ExchangeName]:
         return set(cls._WS_FACTORY.keys())
 
-    def _start_ws_feeds(self, session: aiohttp.ClientSession) -> list[asyncio.Task]:
+    async def _start_ws_feeds(self, session: aiohttp.ClientSession) -> list[asyncio.Task]:
         """Create WebSocket feed tasks for all configured exchanges."""
         ws_factory = self._WS_FACTORY
 
@@ -707,10 +712,12 @@ class QuoteScanner:
                 if self.symbol_rotator is not None
                 else self.settings.symbols
             )
+            feed_kwargs = await self._ws_feed_kwargs(exchange_name, active_symbols)
             feed = feed_cls(
                 session=session,
                 symbols=active_symbols,
                 on_quote=self._on_quote,
+                **feed_kwargs,
             )
             self._ws_feeds.append(feed)
             tasks.append(
@@ -721,11 +728,53 @@ class QuoteScanner:
             )
         return tasks
 
+    async def _ws_feed_kwargs(
+        self,
+        exchange_name: ExchangeName,
+        symbols: list[str],
+    ) -> dict[str, object]:
+        if exchange_name in {ExchangeName.GATE, ExchangeName.OKX}:
+            return {
+                "base_qty_per_contract": await self._load_book_size_per_contract(exchange_name, symbols),
+            }
+        return {}
+
+    async def _load_book_size_per_contract(
+        self,
+        exchange_name: ExchangeName,
+        symbols: list[str],
+    ) -> dict[str, Decimal]:
+        client = self.exchange_clients_by_name.get(exchange_name)
+        if client is None:
+            return {}
+
+        result: dict[str, Decimal] = {}
+        for symbol in symbols:
+            try:
+                if isinstance(client, GateExchange):
+                    result[symbol] = await client.book_size_to_base_qty(symbol, Decimal("1"))
+                elif isinstance(client, OkxExchange):
+                    result[symbol] = await client.book_size_to_base_qty(symbol, Decimal("1"))
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning(
+                    "failed to preload book-size metadata | %s %s | %s",
+                    exchange_name.value,
+                    symbol,
+                    exc,
+                )
+        return result
+
     async def _on_dynamic_symbols_changed(self, added: list[str], removed: list[str]) -> None:
         """Called by SymbolRotator when dynamic symbols change."""
+        self._apply_rest_symbol_changes(added=added, removed=removed)
+
         if added:
             for feed in self._ws_feeds:
                 try:
+                    if isinstance(feed, GateWsFeed | OkxWsFeed):
+                        feed.set_base_qty_per_contract(
+                            await self._load_book_size_per_contract(feed.name, added),
+                        )
                     await feed.subscribe_symbols(added)
                 except Exception as exc:  # noqa: BLE001
                     self.log.warning(
@@ -788,7 +837,7 @@ class QuoteScanner:
         return [
             asyncio.create_task(
                 exchange.poll(
-                    symbols=self.settings.symbols,
+                    symbols=self._rest_poll_symbols,
                     on_quote=self._on_quote,
                     stop_event=self.stop_event,
                     poll_interval_sec=self.settings.poll_interval_sec,
@@ -798,6 +847,26 @@ class QuoteScanner:
             )
             for exchange in exchanges
         ]
+
+    def _current_active_symbols(self) -> list[str]:
+        if self.symbol_rotator is not None:
+            return list(self.symbol_rotator.get_all_active_symbols())
+        return list(self.settings.symbols)
+
+    def _reset_rest_poll_symbols(self) -> None:
+        active_symbols = self._current_active_symbols()
+        self._rest_poll_symbols[:] = active_symbols
+
+    def _apply_rest_symbol_changes(self, *, added: list[str], removed: list[str]) -> None:
+        if removed:
+            removed_set = set(removed)
+            self._rest_poll_symbols[:] = [
+                symbol for symbol in self._rest_poll_symbols
+                if symbol not in removed_set
+            ]
+        for symbol in added:
+            if symbol not in self._rest_poll_symbols:
+                self._rest_poll_symbols.append(symbol)
 
     def _build_exchanges(
         self,

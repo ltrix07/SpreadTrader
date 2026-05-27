@@ -16,19 +16,36 @@ class OkxWsFeed(WebSocketFeed):
 
     _STRIP_1000_PREFIX: dict[str, str] = {
         "1000BONKUSDT": "BONK",
+        "1000SHIBUSDT": "SHIB",
     }
     _PRICE_MULTIPLIER: dict[str, int] = {
         "1000BONKUSDT": 1000,
+        "1000SHIBUSDT": 1000,
     }
 
     # Reverse: OKX instId base → canonical symbol.
     _INST_TO_CANONICAL: dict[str, str] = {
         "BONK-USDT-SWAP": "1000BONKUSDT",
+        "SHIB-USDT-SWAP": "1000SHIBUSDT",
     }
+
+    def __init__(
+        self,
+        session,
+        symbols,
+        on_quote,
+        *,
+        base_qty_per_contract: dict[str, Decimal] | None = None,
+    ) -> None:
+        super().__init__(session=session, symbols=symbols, on_quote=on_quote)
+        self._base_qty_per_contract = dict(base_qty_per_contract or {})
 
     @property
     def name(self) -> ExchangeName:
         return ExchangeName.OKX
+
+    def set_base_qty_per_contract(self, mapping: dict[str, Decimal]) -> None:
+        self._base_qty_per_contract.update(mapping)
 
     def _to_inst_id(self, symbol: Symbol) -> str:
         if symbol in self._STRIP_1000_PREFIX:
@@ -117,13 +134,15 @@ class OkxWsFeed(WebSocketFeed):
         ask_price = Decimal(asks[0][0])
         ask_size = Decimal(asks[0][1])
 
+        base_qty_per_contract = self._base_qty_per_contract.get(canonical, Decimal("1"))
+        bid_size *= base_qty_per_contract
+        ask_size *= base_qty_per_contract
+
         multiplier = self._PRICE_MULTIPLIER.get(canonical)
         if multiplier:
             m = Decimal(multiplier)
             bid_price *= m
             ask_price *= m
-            bid_size /= m
-            ask_size /= m
 
         ts_ms = tick.get("ts")
         received_at = datetime.now(UTC)

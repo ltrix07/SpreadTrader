@@ -537,6 +537,13 @@ class MexcExchange(ExchangeClient):
         min_vol = Decimal(str(detail.get("minVol", "1")))
         return await self._contracts_to_base_qty(symbol, min_vol)
 
+    async def get_qty_step_size(self, symbol: str) -> Decimal:
+        detail = await self._contract_detail(symbol)
+        vol_unit = Decimal(str(detail.get("volUnit", "1")))
+        if vol_unit <= 0:
+            vol_unit = Decimal("1")
+        return await self._contracts_to_base_qty(symbol, vol_unit)
+
     async def get_funding_info(self, symbol: str) -> FundingInfo:
         mexc_symbol = self._to_mexc_symbol(symbol)
         endpoint = f"https://contract.mexc.com/api/v1/contract/funding_rate/{mexc_symbol}"

@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Callable
 
 from .config import Settings
-from .models import ExchangeName, Quote
+from .models import ExchangeName, FundingInfo, Quote
 from .opportunity import SpreadOpportunity, classify_opportunity
 from .storage import OpportunityStore, PaperTradeRecord
 
@@ -54,6 +54,8 @@ class OpenPaperPosition:
     estimated_entry_slippage_usdt: float
     max_adverse_spread_pct: float
     max_favorable_spread_pct: float
+    entry_long_funding: FundingInfo | None = None
+    entry_short_funding: FundingInfo | None = None
 
     @property
     def key(self) -> tuple[str, ExchangeName, ExchangeName]:
@@ -91,6 +93,7 @@ def calculate_pnl(
     exit_fees_usdt: float,
     entry_slippage_usdt: float,
     exit_slippage_usdt: float,
+    funding_usdt: float = 0.0,
 ) -> PnlResult:
     # Guard against zero/missing prices from exchange API failures.
     # Fall back to entry price (= zero PnL on that leg) rather than
@@ -108,7 +111,6 @@ def calculate_pnl(
 
     fees_usdt = entry_fees_usdt + exit_fees_usdt
     slippage_usdt = entry_slippage_usdt + exit_slippage_usdt
-    funding_usdt = 0.0
     net_pnl_usdt = gross_pnl_usdt - fees_usdt - slippage_usdt - funding_usdt
 
     # Basis: total exposure = 2 * per-leg notional.
@@ -125,6 +127,32 @@ def calculate_pnl(
     )
 
 
+def estimate_accrued_funding_usdt(
+    *,
+    notional_usdt: float,
+    long_funding: FundingInfo,
+    short_funding: FundingInfo,
+    window_start: datetime,
+    window_end: datetime,
+) -> float:
+    if window_end <= window_start:
+        return 0.0
+
+    def _payments_in_window(funding: FundingInfo) -> int:
+        count = 0
+        next_t = funding.next_funding_time
+        interval = timedelta(hours=funding.funding_interval_hours)
+        while next_t <= window_end:
+            if next_t > window_start:
+                count += 1
+            next_t += interval
+        return count
+
+    long_cost_usdt = notional_usdt * float(long_funding.funding_rate) * _payments_in_window(long_funding)
+    short_gain_usdt = notional_usdt * float(short_funding.funding_rate) * _payments_in_window(short_funding)
+    return long_cost_usdt - short_gain_usdt
+
+
 class PaperEngine:
     def __init__(
         self,
@@ -132,10 +160,12 @@ class PaperEngine:
         settings: Settings,
         opportunity_store: OpportunityStore,
         get_latest_quote: Callable[[ExchangeName, str], Quote | None],
+        get_funding_info: Callable[[ExchangeName, str], FundingInfo | None] | None = None,
     ) -> None:
         self.settings = settings
         self.opportunity_store = opportunity_store
         self.get_latest_quote = get_latest_quote
+        self.get_funding_info = get_funding_info
         self.log = logging.getLogger(__name__)
 
         self.pending_entries: dict[tuple[str, ExchangeName, ExchangeName], PendingEntry] = {}
@@ -149,6 +179,11 @@ class PaperEngine:
         self.exchange_fees_pct: dict[ExchangeName, float] = {
             ExchangeName.MEXC: self.settings.taker_fee_mexc_pct,
             ExchangeName.BYBIT: self.settings.taker_fee_bybit_pct,
+            ExchangeName.OKX: self.settings.taker_fee_okx_pct,
+            ExchangeName.BINANCE: self.settings.taker_fee_binance_pct,
+            ExchangeName.GATE: self.settings.taker_fee_gate_pct,
+            ExchangeName.BITGET: self.settings.taker_fee_bitget_pct,
+            ExchangeName.HTX: self.settings.taker_fee_htx_pct,
         }
 
     async def shutdown(self) -> None:
@@ -313,6 +348,11 @@ class PaperEngine:
                 notional_usdt=self.settings.paper_notional_usdt,
                 slippage_buffer_pct=self.settings.slippage_buffer_pct,
             )
+            entry_long_funding = None
+            entry_short_funding = None
+            if self.get_funding_info is not None:
+                entry_long_funding = self.get_funding_info(opportunity.long_exchange, opportunity.symbol)
+                entry_short_funding = self.get_funding_info(opportunity.short_exchange, opportunity.symbol)
 
             position = OpenPaperPosition(
                 symbol=opportunity.symbol,
@@ -328,6 +368,8 @@ class PaperEngine:
                 estimated_entry_slippage_usdt=entry_slippage_usdt,
                 max_adverse_spread_pct=raw_spread_pct,
                 max_favorable_spread_pct=raw_spread_pct,
+                entry_long_funding=entry_long_funding,
+                entry_short_funding=entry_short_funding,
             )
             self.open_positions[position.key] = position
 
@@ -388,6 +430,15 @@ class PaperEngine:
             notional_usdt=position.notional_usdt,
             slippage_buffer_pct=self.settings.slippage_buffer_pct,
         )
+        funding_usdt = 0.0
+        if position.entry_long_funding is not None and position.entry_short_funding is not None:
+            funding_usdt = estimate_accrued_funding_usdt(
+                notional_usdt=position.notional_usdt,
+                long_funding=position.entry_long_funding,
+                short_funding=position.entry_short_funding,
+                window_start=position.opened_at,
+                window_end=now,
+            )
         pnl = calculate_pnl(
             notional_usdt=position.notional_usdt,
             entry_long_price=position.entry_long_price,
@@ -398,6 +449,7 @@ class PaperEngine:
             exit_fees_usdt=exit_fees_usdt,
             entry_slippage_usdt=position.estimated_entry_slippage_usdt,
             exit_slippage_usdt=exit_slippage_usdt,
+            funding_usdt=funding_usdt,
         )
 
         hold_seconds = (now - position.opened_at).total_seconds()

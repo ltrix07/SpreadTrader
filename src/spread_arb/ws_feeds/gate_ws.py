@@ -32,9 +32,23 @@ class GateWsFeed(WebSocketFeed):
         "BONK_USDT": "1000BONKUSDT",
     }
 
+    def __init__(
+        self,
+        session,
+        symbols,
+        on_quote,
+        *,
+        base_qty_per_contract: dict[str, Decimal] | None = None,
+    ) -> None:
+        super().__init__(session=session, symbols=symbols, on_quote=on_quote)
+        self._base_qty_per_contract = dict(base_qty_per_contract or {})
+
     @property
     def name(self) -> ExchangeName:
         return ExchangeName.GATE
+
+    def set_base_qty_per_contract(self, mapping: dict[str, Decimal]) -> None:
+        self._base_qty_per_contract.update(mapping)
 
     def _to_gate_contract(self, symbol: Symbol) -> str:
         if symbol in self._STRIP_1000_PREFIX:
@@ -167,14 +181,17 @@ class GateWsFeed(WebSocketFeed):
         ask_price = Decimal(ask_price_raw)
         ask_size = Decimal(str(ask_size_raw)) if ask_size_raw else Decimal(0)
 
-        # Normalise 1000-prefix symbols.
+        base_qty_per_contract = self._base_qty_per_contract.get(canonical, Decimal("1"))
+        bid_size *= base_qty_per_contract
+        ask_size *= base_qty_per_contract
+
+        # Prices need canonical 1000-prefix normalization, but sizes are
+        # already converted into canonical base units.
         multiplier = self._PRICE_MULTIPLIER.get(canonical)
         if multiplier:
             m = Decimal(multiplier)
             bid_price *= m
             ask_price *= m
-            bid_size /= m
-            ask_size /= m
 
         ts_ms = result.get("t")
         received_at = datetime.now(UTC)

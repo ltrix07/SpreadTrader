@@ -35,6 +35,10 @@ class BinanceExchange(ExchangeClient):
         "SHIBUSDT": 1000,
     }
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._lot_size_cache: dict[str, dict[str, Decimal]] = {}
+
     @property
     def name(self) -> ExchangeName:
         return ExchangeName.BINANCE
@@ -56,6 +60,34 @@ class BinanceExchange(ExchangeClient):
         if not divisor:
             return qty
         return qty * Decimal(divisor)
+
+    async def _lot_size_rules(self, symbol: str) -> dict[str, Decimal]:
+        bn_symbol = self._to_binance_symbol(symbol)
+        cached = self._lot_size_cache.get(bn_symbol)
+        if cached is not None:
+            return cached
+
+        url = f"{self.base_url}/fapi/v1/exchangeInfo"
+        async with self.session.get(url, timeout=self.request_timeout_sec) as response:
+            data = await response.json()
+            if response.status != 200:
+                raise RuntimeError(f"Binance exchangeInfo error: {data}")
+        for symbol_info in data.get("symbols", []):
+            if symbol_info.get("symbol") != bn_symbol:
+                continue
+            filters = symbol_info.get("filters", [])
+            market_lot = next((item for item in filters if item.get("filterType") == "MARKET_LOT_SIZE"), None)
+            lot_size = next((item for item in filters if item.get("filterType") == "LOT_SIZE"), None)
+            selected = market_lot or lot_size
+            if selected is None:
+                break
+            rules = {
+                "min_qty": self._to_canonical_qty(symbol, Decimal(selected["minQty"])),
+                "step_size": self._to_canonical_qty(symbol, Decimal(selected["stepSize"])),
+            }
+            self._lot_size_cache[bn_symbol] = rules
+            return rules
+        raise RuntimeError(f"Lot size rules not found for {symbol}")
 
     async def fetch_quote(self, symbol: Symbol) -> Quote:
         started = time.perf_counter()
@@ -244,18 +276,10 @@ class BinanceExchange(ExchangeClient):
         raise RuntimeError(f"Position not found for {symbol}")
 
     async def get_min_order_qty(self, symbol: str) -> Decimal:
-        bn_symbol = self._to_binance_symbol(symbol)
-        url = f"{self.base_url}/fapi/v1/exchangeInfo"
-        async with self.session.get(url, timeout=self.request_timeout_sec) as response:
-            data = await response.json()
-            if response.status != 200:
-                raise RuntimeError(f"Binance exchangeInfo error: {data}")
-        for symbol_info in data.get("symbols", []):
-            if symbol_info.get("symbol") == bn_symbol:
-                for filter_info in symbol_info.get("filters", []):
-                    if filter_info.get("filterType") == "LOT_SIZE":
-                        return self._to_canonical_qty(symbol, Decimal(filter_info["minQty"]))
-        raise RuntimeError(f"Min qty not found for {symbol}")
+        return (await self._lot_size_rules(symbol))["min_qty"]
+
+    async def get_qty_step_size(self, symbol: str) -> Decimal:
+        return (await self._lot_size_rules(symbol))["step_size"]
 
     async def get_funding_info(self, symbol: str) -> FundingInfo:
         bn_symbol = self._to_binance_symbol(symbol)

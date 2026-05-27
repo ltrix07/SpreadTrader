@@ -82,6 +82,13 @@ class ExchangeClient(ABC):
     async def get_min_order_qty(self, symbol: str) -> Decimal:
         raise NotImplementedError(f"{self.name.value} does not support min qty queries")
 
+    async def get_qty_step_size(self, symbol: str) -> Decimal:
+        raise NotImplementedError(f"{self.name.value} does not support qty step queries")
+
+    async def get_trigger_fill_result(self, symbol: str, trigger_order_id: str) -> OrderResult | None:
+        _ = symbol, trigger_order_id
+        return None
+
     async def poll(
         self,
         symbols: Sequence[Symbol],

@@ -2,6 +2,7 @@ import asyncio
 import gzip
 import json
 from collections.abc import Awaitable
+from decimal import Decimal
 from typing import cast
 
 import aiohttp
@@ -10,6 +11,7 @@ from spread_arb.models import ExchangeName, Quote
 from spread_arb.ws_feeds.base import WebSocketFeed
 from spread_arb.ws_feeds.gate_ws import GateWsFeed
 from spread_arb.ws_feeds.htx_ws import HtxWsFeed
+from spread_arb.ws_feeds.okx_ws import OkxWsFeed
 
 
 def _noop_quote(_: Quote) -> Awaitable[None] | None:
@@ -26,6 +28,14 @@ def _make_htx_feed() -> HtxWsFeed:
 
 def _make_gate_feed() -> GateWsFeed:
     return GateWsFeed(
+        session=cast(aiohttp.ClientSession, object()),
+        symbols=["SOLUSDT"],
+        on_quote=_noop_quote,
+    )
+
+
+def _make_okx_feed() -> OkxWsFeed:
+    return OkxWsFeed(
         session=cast(aiohttp.ClientSession, object()),
         symbols=["SOLUSDT"],
         on_quote=_noop_quote,
@@ -92,6 +102,56 @@ def test_gate_parse_subscription_error_increments_counter() -> None:
     assert quote is None
     assert feed._subscription_ok_count == 0
     assert feed._subscription_error_count == 1
+
+
+def test_gate_parse_update_normalizes_contract_sizes_to_base_units() -> None:
+    feed = GateWsFeed(
+        session=cast(aiohttp.ClientSession, object()),
+        symbols=["SOLUSDT"],
+        on_quote=_noop_quote,
+        base_qty_per_contract={"SOLUSDT": Decimal("0.001")},
+    )
+    raw = json.dumps({
+        "channel": "futures.book_ticker",
+        "event": "update",
+        "result": {
+            "s": "SOL_USDT",
+            "b": "100.0",
+            "B": "500",
+            "a": "100.1",
+            "A": "750",
+            "t": "1712345678901",
+        },
+    })
+
+    quote = feed._parse_message(raw)
+
+    assert quote is not None
+    assert quote.best_bid_size == Decimal("0.500")
+    assert quote.best_ask_size == Decimal("0.750")
+
+
+def test_okx_parse_update_normalizes_contract_sizes_to_base_units() -> None:
+    feed = OkxWsFeed(
+        session=cast(aiohttp.ClientSession, object()),
+        symbols=["SOLUSDT"],
+        on_quote=_noop_quote,
+        base_qty_per_contract={"SOLUSDT": Decimal("0.1")},
+    )
+    raw = json.dumps({
+        "arg": {"channel": "bbo-tbt", "instId": "SOL-USDT-SWAP"},
+        "data": [{
+            "bids": [["100.0", "5", "0", "1"]],
+            "asks": [["100.1", "7", "0", "1"]],
+            "ts": "1712345678901",
+        }],
+    })
+
+    quote = feed._parse_message(raw)
+
+    assert quote is not None
+    assert quote.best_bid_size == Decimal("0.5")
+    assert quote.best_ask_size == Decimal("0.7")
 
 
 def test_htx_server_ping_is_handled_and_pong_is_sent() -> None:
@@ -181,3 +241,60 @@ def test_ping_payload_none_disables_ping_task_start() -> None:
     assert len(session.calls) == 1
     assert session.calls[0]["heartbeat"] is None
 
+
+def test_subscribe_symbols_updates_durable_state_when_socket_is_unavailable() -> None:
+    class DummyFeed(WebSocketFeed):
+        ws_url = "wss://example.com/ws"
+
+        @property
+        def name(self) -> ExchangeName:
+            return ExchangeName.HTX
+
+        def _build_subscribe_messages(self) -> list[str]:
+            return []
+
+        def _parse_message(self, raw: str | bytes) -> Quote | None:
+            return None
+
+    async def _run() -> None:
+        feed = DummyFeed(
+            session=cast(aiohttp.ClientSession, object()),
+            symbols=["SOLUSDT"],
+            on_quote=_noop_quote,
+        )
+        feed._ws = None
+
+        await feed.subscribe_symbols(["BTCUSDT", "SOLUSDT"])
+
+        assert feed.symbols == ["SOLUSDT", "BTCUSDT"]
+
+    asyncio.run(_run())
+
+
+def test_unsubscribe_symbols_updates_durable_state_when_socket_is_unavailable() -> None:
+    class DummyFeed(WebSocketFeed):
+        ws_url = "wss://example.com/ws"
+
+        @property
+        def name(self) -> ExchangeName:
+            return ExchangeName.HTX
+
+        def _build_subscribe_messages(self) -> list[str]:
+            return []
+
+        def _parse_message(self, raw: str | bytes) -> Quote | None:
+            return None
+
+    async def _run() -> None:
+        feed = DummyFeed(
+            session=cast(aiohttp.ClientSession, object()),
+            symbols=["SOLUSDT", "BTCUSDT"],
+            on_quote=_noop_quote,
+        )
+        feed._ws = None
+
+        await feed.unsubscribe_symbols(["BTCUSDT"])
+
+        assert feed.symbols == ["SOLUSDT"]
+
+    asyncio.run(_run())

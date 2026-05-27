@@ -4,15 +4,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
 
 from .config import Settings
 from .exchanges.base import ExchangeClient
-from .models import BalanceInfo, ExchangeName, Quote, SpreadOrderResult
+from .models import BalanceInfo, ExchangeName, OrderResult, PositionInfo, Quote, SpreadOrderResult
 
 
 class ExecutionError(Exception):
     """Raised when order execution fails."""
+
+    def __init__(self, message: str, *, positions_flat: bool = False) -> None:
+        super().__init__(message)
+        self.positions_flat = positions_flat
 
 
 class ExecutionService:
@@ -145,6 +150,13 @@ class ExecutionService:
                 timeout=self.settings.order_timeout_sec,
             )
         except asyncio.TimeoutError as exc:
+            recovered = await self._recover_entry_timeout(
+                symbol=symbol,
+                long_exchange=long_exchange,
+                short_exchange=short_exchange,
+            )
+            if recovered is not None:
+                return recovered
             raise ExecutionError(f"order timeout after {self.settings.order_timeout_sec}s") from exc
 
         if isinstance(long_result, Exception) and isinstance(short_result, Exception):
@@ -202,6 +214,17 @@ class ExecutionService:
                 timeout=self.settings.order_timeout_sec,
             )
         except asyncio.TimeoutError as exc:
+            positions_flat = await self._positions_flat_after_timeout(
+                symbol=symbol,
+                long_exchange=long_exchange,
+                short_exchange=short_exchange,
+            )
+            if positions_flat:
+                self.log.warning("EXIT TIMEOUT RECOVERED | %s | both legs already flat", symbol)
+                raise ExecutionError(
+                    f"exit timeout after {self.settings.order_timeout_sec}s, but both legs are flat",
+                    positions_flat=True,
+                ) from exc
             self.log.critical("EXIT TIMEOUT | %s | manual intervention needed", symbol)
             raise ExecutionError(f"exit timeout after {self.settings.order_timeout_sec}s") from exc
 
@@ -311,12 +334,33 @@ class ExecutionService:
             except Exception as exc:
                 self.log.warning("failed to cancel short stop | %s | %s | %s", symbol, short_exchange.value, exc)
 
+    async def get_trigger_fill_result(
+        self,
+        *,
+        exchange: ExchangeName,
+        symbol: str,
+        trigger_order_id: str,
+    ) -> OrderResult | None:
+        if not trigger_order_id:
+            return None
+        try:
+            return await self.clients[exchange].get_trigger_fill_result(symbol, trigger_order_id)
+        except Exception as exc:
+            self.log.warning(
+                "trigger fill lookup failed | %s %s | trigger_order_id=%s | %s",
+                exchange.value,
+                symbol,
+                trigger_order_id,
+                exc,
+            )
+            return None
+
     async def _round_qty(self, exchange: ExchangeName, symbol: str, qty: Decimal) -> Decimal:
         """Round qty DOWN to the exchange's step size (lot size)."""
         cache_key = (exchange, symbol)
         if cache_key not in self._step_size_cache:
             try:
-                step = await self.clients[exchange].get_min_order_qty(symbol)
+                step = await self.clients[exchange].get_qty_step_size(symbol)
                 self._step_size_cache[cache_key] = step
             except (NotImplementedError, Exception):
                 # Fallback: round to 3 decimal places
@@ -373,3 +417,160 @@ class ExecutionService:
         except Exception as exc:
             self._leverage_last_fail_ts[key] = now
             self.log.warning("set_leverage failed on %s %s: %s", exchange.value, symbol, exc)
+
+    async def _get_position_safe(self, exchange: ExchangeName, symbol: str) -> PositionInfo | None:
+        try:
+            return await self.clients[exchange].get_position(symbol)
+        except Exception as exc:
+            self.log.warning(
+                "position check failed during timeout recovery | %s %s | %s",
+                exchange.value,
+                symbol,
+                exc,
+            )
+            return None
+
+    @staticmethod
+    def _position_is_open(position: PositionInfo | None) -> bool:
+        return position is not None and abs(position.size) > 0
+
+    @staticmethod
+    def _close_side_for_position(position: PositionInfo) -> str:
+        return "sell" if position.size > 0 else "buy"
+
+    def _recovered_order_result(
+        self,
+        *,
+        exchange: ExchangeName,
+        symbol: str,
+        side: str,
+        position: PositionInfo,
+    ) -> OrderResult:
+        return OrderResult(
+            exchange=exchange,
+            symbol=symbol,
+            side=side,
+            filled_qty=abs(position.size),
+            avg_price=position.entry_price,
+            fee=Decimal("0"),
+            fee_currency="USDT",
+            order_id=f"recovered-timeout-{exchange.value}-{symbol}",
+            timestamp=datetime.now(UTC),
+            is_partial=False,
+            raw_response={"recovered_from_timeout": True},
+        )
+
+    async def _flatten_open_position_after_timeout(
+        self,
+        *,
+        exchange: ExchangeName,
+        symbol: str,
+        position: PositionInfo,
+    ) -> None:
+        side = self._close_side_for_position(position)
+        qty = abs(position.size)
+        try:
+            await self.clients[exchange].place_market_order(symbol, side, qty, close=True)
+            self.log.warning(
+                "timeout recovery flatten succeeded | %s %s | side=%s qty=%s",
+                exchange.value,
+                symbol,
+                side,
+                qty,
+            )
+        except Exception as exc:
+            self.log.critical(
+                "timeout recovery flatten failed | %s %s | side=%s qty=%s | %s",
+                exchange.value,
+                symbol,
+                side,
+                qty,
+                exc,
+            )
+
+    async def _recover_entry_timeout(
+        self,
+        *,
+        symbol: str,
+        long_exchange: ExchangeName,
+        short_exchange: ExchangeName,
+    ) -> SpreadOrderResult | None:
+        long_position, short_position = await asyncio.gather(
+            self._get_position_safe(long_exchange, symbol),
+            self._get_position_safe(short_exchange, symbol),
+        )
+        long_open = self._position_is_open(long_position)
+        short_open = self._position_is_open(short_position)
+
+        if long_open and short_open and long_position is not None and short_position is not None:
+            self.log.critical(
+                "ENTRY TIMEOUT RECOVERED | %s | long=%s size=%s entry=%s | short=%s size=%s entry=%s",
+                symbol,
+                long_exchange.value,
+                long_position.size,
+                long_position.entry_price,
+                short_exchange.value,
+                short_position.size,
+                short_position.entry_price,
+            )
+            self.invalidate_balance_cache(long_exchange)
+            self.invalidate_balance_cache(short_exchange)
+            return SpreadOrderResult(
+                long_order=self._recovered_order_result(
+                    exchange=long_exchange,
+                    symbol=symbol,
+                    side="buy",
+                    position=long_position,
+                ),
+                short_order=self._recovered_order_result(
+                    exchange=short_exchange,
+                    symbol=symbol,
+                    side="sell",
+                    position=short_position,
+                ),
+            )
+
+        if long_open or short_open:
+            self.log.critical(
+                "ENTRY TIMEOUT PARTIAL | %s | long_open=%s short_open=%s | attempting to flatten exposure",
+                symbol,
+                long_open,
+                short_open,
+            )
+            flatten_tasks: list[asyncio.Task[None]] = []
+            if long_open and long_position is not None:
+                flatten_tasks.append(asyncio.create_task(
+                    self._flatten_open_position_after_timeout(
+                        exchange=long_exchange,
+                        symbol=symbol,
+                        position=long_position,
+                    )
+                ))
+            if short_open and short_position is not None:
+                flatten_tasks.append(asyncio.create_task(
+                    self._flatten_open_position_after_timeout(
+                        exchange=short_exchange,
+                        symbol=symbol,
+                        position=short_position,
+                    )
+                ))
+            if flatten_tasks:
+                await asyncio.gather(*flatten_tasks, return_exceptions=True)
+            raise ExecutionError(
+                f"entry timeout after {self.settings.order_timeout_sec}s with partial open exposure; flatten attempted"
+            )
+
+        return None
+
+    async def _positions_flat_after_timeout(
+        self,
+        *,
+        symbol: str,
+        long_exchange: ExchangeName,
+        short_exchange: ExchangeName,
+    ) -> bool:
+        long_position, short_position = await asyncio.gather(
+            self._get_position_safe(long_exchange, symbol),
+            self._get_position_safe(short_exchange, symbol),
+        )
+        return not self._position_is_open(long_position) and not self._position_is_open(short_position)

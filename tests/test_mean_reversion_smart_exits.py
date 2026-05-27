@@ -5,6 +5,8 @@ from collections import deque
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from spread_arb.config import Settings
 from spread_arb.mean_reversion_engine import (
     MeanRevPosition,
@@ -13,7 +15,7 @@ from spread_arb.mean_reversion_engine import (
     _bbo_walk_pct,
     _roundtrip_cost_pct,
 )
-from spread_arb.models import ExchangeName, Quote
+from spread_arb.models import ExchangeName, FundingInfo, Quote
 
 
 class DummyOpportunityStore:
@@ -158,6 +160,67 @@ def test_timeout_hard_close_after_max_hold() -> None:
     assert close_reasons == ["timeout_loss"]
 
 
+def test_timeout_pnl_guard_includes_estimated_funding_cost() -> None:
+    now = datetime.now(UTC)
+    engine = _build_engine(
+        mr_max_hold_seconds=10,
+        mr_timeout_max_hold_seconds=50000,
+        mr_timeout_min_pnl_usdt=0.0,
+        slippage_buffer_pct=0.0,
+    )
+    position = MeanRevPosition(
+        symbol="BTCUSDT",
+        long_exchange=ExchangeName.BYBIT,
+        short_exchange=ExchangeName.OKX,
+        direction="ab",
+        notional_usdt=100.0,
+        opened_at=now - timedelta(hours=10),
+        entry_long_price=100.0,
+        entry_short_price=101.0,
+        entry_spread_pct=1.0,
+        entry_rolling_mean=0.5,
+        entry_rolling_std=0.2,
+        sigma_at_entry=2.5,
+        take_profit_target=0.4,
+        max_adverse_spread_pct=0.0,
+        max_favorable_spread_pct=0.0,
+        estimated_entry_fees_usdt=0.0,
+        estimated_entry_slippage_usdt=0.0,
+        entry_long_funding=FundingInfo(
+            exchange=ExchangeName.BYBIT,
+            symbol="BTCUSDT",
+            funding_rate=Decimal("0.002"),
+            next_funding_time=now - timedelta(hours=6),
+            funding_interval_hours=8,
+            fetched_at=now - timedelta(hours=10),
+        ),
+        entry_short_funding=FundingInfo(
+            exchange=ExchangeName.OKX,
+            symbol="BTCUSDT",
+            funding_rate=Decimal("0"),
+            next_funding_time=now - timedelta(hours=6),
+            funding_interval_hours=8,
+            fetched_at=now - timedelta(hours=10),
+        ),
+    )
+    engine.open_positions_by_symbol[position.symbol] = position
+    close_reasons: list[str] = []
+
+    def fake_schedule_close(*, position: MeanRevPosition, close_reason: str, long_quote: Quote | None, short_quote: Quote | None) -> None:
+        close_reasons.append(close_reason)
+
+    engine._schedule_close = fake_schedule_close  # type: ignore[method-assign]
+
+    long_quote = _quote(exchange=ExchangeName.BYBIT, symbol="BTCUSDT", bid="100.10", ask="100.20", bid_size="10", ask_size="10")
+    short_quote = _quote(exchange=ExchangeName.OKX, symbol="BTCUSDT", bid="100.80", ask="100.95", bid_size="10", ask_size="10")
+    engine.check_exits({
+        (ExchangeName.BYBIT, "BTCUSDT"): long_quote,
+        (ExchangeName.OKX, "BTCUSDT"): short_quote,
+    })
+
+    assert close_reasons == []
+
+
 def test_liquidity_filter_rejects_thin_top_of_book() -> None:
     engine = _build_engine(mr_notional_usdt=100.0, mr_min_top_capacity_multiplier=3.0, mr_max_bbo_spread_bps=15.0)
     _seed_ready_baseline(
@@ -293,6 +356,21 @@ def test_revalidation_rejects_thin_liquidity() -> None:
         assert "BTCUSDT" not in engine.open_positions_by_symbol
 
     asyncio.run(_run())
+
+
+def test_log_summary_reports_timeout_loss_count(caplog: pytest.LogCaptureFixture) -> None:
+    engine = _build_engine()
+    engine.closed_trades_count = 4
+    engine.winning_trades_count = 1
+    engine.total_net_pnl_usdt = -0.4
+    engine.total_hold_seconds = 40.0
+    engine.close_reason_counts["timeout"] = 1
+    engine.close_reason_counts["timeout_loss"] = 2
+
+    with caplog.at_level("INFO"):
+        engine.log_summary()
+
+    assert "timeout_loss=2" in caplog.text
 
 
 def test_winning_counter_includes_timeout_wins() -> None:

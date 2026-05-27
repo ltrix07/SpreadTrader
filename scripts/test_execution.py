@@ -135,10 +135,10 @@ async def run_test(exchange_name: str, symbol: str, notional: float, leverage: i
 
         try:
             min_qty = await client.get_min_order_qty(symbol)
-            # Round qty down to step size
-            if min_qty > 0:
-                qty = (qty / min_qty).to_integral_value(rounding=ROUND_DOWN) * min_qty
-            log.info("Min order qty: %s, our qty: %s", min_qty, qty)
+            step_size = await client.get_qty_step_size(symbol)
+            if step_size > 0:
+                qty = (qty / step_size).to_integral_value(rounding=ROUND_DOWN) * step_size
+            log.info("Min order qty: %s, step size: %s, our qty: %s", min_qty, step_size, qty)
             if qty < min_qty:
                 log.error(
                     "Qty too small! Need at least %s, have %s. Increase --notional or use a cheaper symbol.",

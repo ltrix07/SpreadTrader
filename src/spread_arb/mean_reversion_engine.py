@@ -12,7 +12,7 @@ from typing import Callable
 from .config import Settings
 from .execution import ExecutionError, ExecutionService
 from .models import ExchangeName, FundingInfo, Quote
-from .paper_engine import calculate_pnl
+from .paper_engine import calculate_pnl, estimate_accrued_funding_usdt
 from .storage import OpportunityStore, PaperTradeRecord
 
 
@@ -82,6 +82,10 @@ class MeanRevPosition:
     actual_qty_short: Decimal | None = None
     long_stop_order_id: str = ""
     short_stop_order_id: str = ""
+    long_stop_trigger_price: float = 0.0
+    short_stop_trigger_price: float = 0.0
+    entry_long_funding: FundingInfo | None = None
+    entry_short_funding: FundingInfo | None = None
 
 
 @dataclass(slots=True)
@@ -190,26 +194,7 @@ class MeanReversionEngine:
                 self.log.info("preload: spread_snapshots table not found, starting cold")
                 return
 
-            window = self.settings.mr_rolling_window
-            max_rows_cap = window * 700
-            exchange_count = len(self.settings.exchanges)
-            pair_count_per_symbol = exchange_count * (exchange_count - 1) // 2
-            estimated_rows = len(self.settings.symbols) * pair_count_per_symbol * window
-            max_rows = min(max_rows_cap, estimated_rows) if estimated_rows > 0 else max_rows_cap
-            rows = conn.execute(
-                """
-                SELECT
-                    symbol,
-                    exchange_a,
-                    exchange_b,
-                    raw_spread_ab_pct,
-                    raw_spread_ba_pct
-                FROM spread_snapshots
-                ORDER BY timestamp DESC
-                LIMIT ?
-                """,
-                (max_rows,),
-            ).fetchall()
+            rows = self._fetch_recent_baseline_rows(conn)
 
             if not rows:
                 self.log.info("preload: no snapshots found, starting cold")
@@ -255,22 +240,7 @@ class MeanReversionEngine:
                 self.log.info("preload symbols: spread_snapshots table not found, starting cold")
                 return
 
-            window = self.settings.mr_rolling_window
-            max_rows = len(target_symbols) * 20 * window
-            placeholders = ",".join("?" for _ in target_symbols)
-            query = f"""
-                SELECT
-                    symbol,
-                    exchange_a,
-                    exchange_b,
-                    raw_spread_ab_pct,
-                    raw_spread_ba_pct
-                FROM spread_snapshots
-                WHERE symbol IN ({placeholders})
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """
-            rows = conn.execute(query, (*target_symbols, max_rows)).fetchall()
+            rows = self._fetch_recent_baseline_rows(conn, target_symbols=target_symbols)
 
             if not rows:
                 self.log.info("preload symbols: no snapshots found for %s", target_symbols)
@@ -292,7 +262,7 @@ class MeanReversionEngine:
 
     def _load_baselines_from_rows(self, rows: list) -> int:
         loaded_count = 0
-        for row in reversed(rows):
+        for row in rows:
             symbol = str(row["symbol"])
             ex_a_raw = str(row["exchange_a"])
             ex_b_raw = str(row["exchange_b"])
@@ -316,6 +286,50 @@ class MeanReversionEngine:
             )
             loaded_count += 1
         return loaded_count
+
+    def _fetch_recent_baseline_rows(
+        self,
+        conn,
+        *,
+        target_symbols: list[str] | None = None,
+    ) -> list:
+        window = self.settings.mr_rolling_window
+        params: list[object] = []
+        where_sql = ""
+        if target_symbols:
+            placeholders = ",".join("?" for _ in target_symbols)
+            where_sql = f"WHERE symbol IN ({placeholders})"
+            params.extend(target_symbols)
+
+        query = f"""
+            WITH ranked AS (
+                SELECT
+                    id,
+                    timestamp,
+                    symbol,
+                    exchange_a,
+                    exchange_b,
+                    raw_spread_ab_pct,
+                    raw_spread_ba_pct,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol, exchange_a, exchange_b
+                        ORDER BY timestamp DESC, id DESC
+                    ) AS rn
+                FROM spread_snapshots
+                {where_sql}
+            )
+            SELECT
+                symbol,
+                exchange_a,
+                exchange_b,
+                raw_spread_ab_pct,
+                raw_spread_ba_pct
+            FROM ranked
+            WHERE rn <= ?
+            ORDER BY symbol ASC, exchange_a ASC, exchange_b ASC, timestamp ASC, id ASC
+        """
+        params.append(window)
+        return conn.execute(query, params).fetchall()
 
     async def shutdown(self) -> None:
         # Cancel pending ENTRIES only (not closes — let them finish).
@@ -425,6 +439,7 @@ class MeanReversionEngine:
             f"mean_reversion={self.close_reason_counts.get('mean_reversion', 0)}",
             f"stop_loss={self.close_reason_counts.get('stop_loss', 0)}",
             f"timeout={self.close_reason_counts.get('timeout', 0)}",
+            f"timeout_loss={self.close_reason_counts.get('timeout_loss', 0)}",
             f"stale_quote={self.close_reason_counts.get('stale_quote', 0)}",
             f"shutdown={self.close_reason_counts.get('shutdown', 0)}",
         ]
@@ -662,6 +677,10 @@ class MeanReversionEngine:
             notional_usdt=position.notional_usdt,
             slippage_buffer_pct=self.settings.slippage_buffer_pct,
         )
+        funding_usdt = self._estimate_position_funding_usdt(
+            position=position,
+            window_end=self._clock(),
+        )
         return calculate_pnl(
             notional_usdt=position.notional_usdt,
             entry_long_price=position.entry_long_price,
@@ -672,7 +691,30 @@ class MeanReversionEngine:
             exit_fees_usdt=exit_fees,
             entry_slippage_usdt=position.estimated_entry_slippage_usdt,
             exit_slippage_usdt=exit_slippage,
+            funding_usdt=funding_usdt,
         )
+
+    def _estimate_position_funding_usdt(
+        self,
+        *,
+        position: MeanRevPosition,
+        window_end: datetime,
+    ) -> float:
+        if position.entry_long_funding is None or position.entry_short_funding is None:
+            return 0.0
+        return estimate_accrued_funding_usdt(
+            notional_usdt=position.notional_usdt,
+            long_funding=position.entry_long_funding,
+            short_funding=position.entry_short_funding,
+            window_start=position.opened_at,
+            window_end=window_end,
+        )
+
+    async def _hydrate_position_funding_if_missing(self, position: MeanRevPosition) -> None:
+        if position.entry_long_funding is not None and position.entry_short_funding is not None:
+            return
+        position.entry_long_funding = await self._get_funding_info(position.long_exchange, position.symbol)
+        position.entry_short_funding = await self._get_funding_info(position.short_exchange, position.symbol)
 
     def _schedule_close(
         self,
@@ -991,6 +1033,8 @@ class MeanReversionEngine:
             if net_edge_pct < self.settings.mr_min_net_edge_pct:
                 return
 
+            long_funding: FundingInfo | None = None
+            short_funding: FundingInfo | None = None
             if self.live_mode and self.settings.mr_funding_filter_enabled:
                 expected_hold_sec = self.settings.mr_max_hold_seconds
                 max_funding_cost_pct = expected_edge_pct * self.settings.mr_funding_max_cost_fraction
@@ -1006,7 +1050,7 @@ class MeanReversionEngine:
                         hold_seconds=expected_hold_sec,
                     )
                     if expected_cost_pct > max_funding_cost_pct:
-                        self.log.info(
+                        self.log.warning(
                             "mr reval REJECT FUNDING | %s %s->%s | expected_cost=%.4f%% > max=%.4f%% (edge=%.4f%%) | "
                             "long_rate=%.4f%% next=%s | short_rate=%.4f%% next=%s",
                             symbol,
@@ -1027,6 +1071,8 @@ class MeanReversionEngine:
                 symbol, current.long_exchange.value, current.short_exchange.value,
                 current_spread_pct, current.signal_spread_pct, delay_sec, net_edge_pct, bbo_walk_pct,
             )
+            entry_long_funding = long_funding
+            entry_short_funding = short_funding
 
             entry_fees_usdt = _one_side_fees_usdt(
                 notional_usdt=notional,
@@ -1049,9 +1095,9 @@ class MeanReversionEngine:
             short_stop_id = ""
 
             if self.live_mode:
+                if self.execution_service is None:
+                    return
                 try:
-                    if self.execution_service is None:
-                        return
                     spread_result = await self.execution_service.execute_spread_entry(
                         symbol=symbol,
                         long_exchange=current.long_exchange,
@@ -1065,15 +1111,6 @@ class MeanReversionEngine:
                     actual_entry_fees = float(spread_result.long_order.fee + spread_result.short_order.fee)
                     actual_qty_long = spread_result.long_order.filled_qty
                     actual_qty_short = spread_result.short_order.filled_qty
-                    long_stop_id, short_stop_id = await self.execution_service.place_protective_stops(
-                        symbol=symbol,
-                        long_exchange=current.long_exchange,
-                        short_exchange=current.short_exchange,
-                        long_qty=actual_qty_long,
-                        short_qty=actual_qty_short,
-                        long_entry_price=spread_result.long_order.avg_price,
-                        short_entry_price=spread_result.short_order.avg_price,
-                    )
                 except Exception as exc:
                     self.log.error("LIVE entry failed | %s | %s", symbol, exc)
                     return
@@ -1083,6 +1120,10 @@ class MeanReversionEngine:
                 actual_entry_fees = entry_fees_usdt
                 actual_qty_long = None
                 actual_qty_short = None
+
+            stop_loss_fraction = self.settings.exchange_stop_loss_pct / 100.0
+            long_stop_trigger_price = entry_long_price * (1.0 - stop_loss_fraction)
+            short_stop_trigger_price = entry_short_price * (1.0 + stop_loss_fraction)
 
             position = MeanRevPosition(
                 symbol=symbol,
@@ -1106,6 +1147,10 @@ class MeanReversionEngine:
                 actual_qty_short=actual_qty_short,
                 long_stop_order_id=long_stop_id,
                 short_stop_order_id=short_stop_id,
+                long_stop_trigger_price=long_stop_trigger_price,
+                short_stop_trigger_price=short_stop_trigger_price,
+                entry_long_funding=entry_long_funding,
+                entry_short_funding=entry_short_funding,
             )
             self.open_positions_by_symbol[symbol] = position
 
@@ -1122,6 +1167,48 @@ class MeanReversionEngine:
                 position.sigma_at_entry,
                 position.take_profit_target,
             )
+
+            if self.live_mode:
+                stops_ready = False
+                try:
+                    long_stop_id, short_stop_id = await self.execution_service.place_protective_stops(
+                        symbol=symbol,
+                        long_exchange=current.long_exchange,
+                        short_exchange=current.short_exchange,
+                        long_qty=position.actual_qty_long or Decimal("0"),
+                        short_qty=position.actual_qty_short or Decimal("0"),
+                        long_entry_price=Decimal(str(position.entry_long_price)),
+                        short_entry_price=Decimal(str(position.entry_short_price)),
+                    )
+                    position.long_stop_order_id = long_stop_id
+                    position.short_stop_order_id = short_stop_id
+                    stops_ready = bool(long_stop_id and short_stop_id)
+                    if not stops_ready:
+                        self.log.critical(
+                            "LIVE entry missing protective stops | %s | long_stop=%s short_stop=%s | closing position immediately",
+                            symbol,
+                            long_stop_id or "<missing>",
+                            short_stop_id or "<missing>",
+                        )
+                except Exception as exc:
+                    self.log.critical(
+                        "LIVE entry filled but stop placement crashed | %s | %s | closing position immediately",
+                        symbol,
+                        exc,
+                    )
+                if not stops_ready:
+                    await self._close_position(
+                        position=position,
+                        close_reason="stop_setup_failed",
+                        long_quote=long_quote,
+                        short_quote=short_quote,
+                    )
+                    if symbol in self.open_positions_by_symbol:
+                        self.log.critical(
+                            "LIVE position still open after protective-stop failure | %s | manual intervention may be required",
+                            symbol,
+                        )
+                    return
         except asyncio.CancelledError:
             raise
         finally:
@@ -1137,6 +1224,7 @@ class MeanReversionEngine:
     ) -> None:
         now = self._clock()
         if self.live_mode:
+            await self._hydrate_position_funding_if_missing(position)
             if self.execution_service is None:
                 self.log.critical("LIVE exit failed | %s | missing execution service", position.symbol)
                 return
@@ -1183,26 +1271,54 @@ class MeanReversionEngine:
                     short_pos = await self.execution_service.clients[position.short_exchange].get_position(position.symbol)
                     if float(long_pos.size) == 0.0 and float(short_pos.size) == 0.0:
                         self.log.info("position already closed (exchange stop triggered) | %s", position.symbol)
+                        long_stop_result, short_stop_result = await asyncio.gather(
+                            self.execution_service.get_trigger_fill_result(
+                                exchange=position.long_exchange,
+                                symbol=position.symbol,
+                                trigger_order_id=position.long_stop_order_id,
+                            ),
+                            self.execution_service.get_trigger_fill_result(
+                                exchange=position.short_exchange,
+                                symbol=position.symbol,
+                                trigger_order_id=position.short_stop_order_id,
+                            ),
+                        )
+                        recovered_stop_fills = long_stop_result is not None and short_stop_result is not None
+
+                        exit_long_price = float(
+                            long_stop_result.avg_price if long_stop_result is not None
+                            else position.long_stop_trigger_price or position.entry_long_price
+                        )
+                        exit_short_price = float(
+                            short_stop_result.avg_price if short_stop_result is not None
+                            else position.short_stop_trigger_price or position.entry_short_price
+                        )
+
+                        if recovered_stop_fills:
+                            exit_fees_usdt = float(long_stop_result.fee + short_stop_result.fee)
+                            exit_slippage_usdt = 0.0
+                        else:
+                            self.log.warning(
+                                "stop-trigger fill details unavailable | %s | using stop trigger prices as fallback",
+                                position.symbol,
+                            )
+                            exit_fees_usdt = _one_side_fees_usdt(
+                                notional_usdt=position.notional_usdt,
+                                fee_long_pct=self._get_fee_pct(position.long_exchange),
+                                fee_short_pct=self._get_fee_pct(position.short_exchange),
+                            )
+                            exit_slippage_usdt = _one_side_slippage_usdt(
+                                notional_usdt=position.notional_usdt,
+                                slippage_buffer_pct=self.settings.slippage_buffer_pct,
+                            )
+
                         if long_quote is None or short_quote is None:
-                            exit_long_price = position.entry_long_price
-                            exit_short_price = position.entry_short_price
                             exit_spread_pct = position.entry_spread_pct
                         else:
-                            exit_long_price = float(long_quote.best_bid_price)
-                            exit_short_price = float(short_quote.best_ask_price)
                             exit_spread_pct = _directional_spread_pct(
                                 ask_long=long_quote.best_ask_price,
                                 bid_short=short_quote.best_bid_price,
                             )
-                        exit_fees_usdt = _one_side_fees_usdt(
-                            notional_usdt=position.notional_usdt,
-                            fee_long_pct=self._get_fee_pct(position.long_exchange),
-                            fee_short_pct=self._get_fee_pct(position.short_exchange),
-                        )
-                        exit_slippage_usdt = _one_side_slippage_usdt(
-                            notional_usdt=position.notional_usdt,
-                            slippage_buffer_pct=self.settings.slippage_buffer_pct,
-                        )
                     else:
                         self.log.critical(
                             "EXIT FAILED and position still open | %s | MANUAL INTERVENTION",
@@ -1240,6 +1356,7 @@ class MeanReversionEngine:
                 slippage_buffer_pct=self.settings.slippage_buffer_pct,
             )
 
+        funding_usdt = self._estimate_position_funding_usdt(position=position, window_end=now)
         pnl = calculate_pnl(
             notional_usdt=position.notional_usdt,
             entry_long_price=position.entry_long_price,
@@ -1250,6 +1367,7 @@ class MeanReversionEngine:
             exit_fees_usdt=exit_fees_usdt,
             entry_slippage_usdt=position.estimated_entry_slippage_usdt,
             exit_slippage_usdt=exit_slippage_usdt,
+            funding_usdt=funding_usdt,
         )
 
         hold_seconds = (now - position.opened_at).total_seconds()
