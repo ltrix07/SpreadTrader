@@ -561,7 +561,7 @@ def test_live_entry_closes_position_when_stop_placement_crashes() -> None:
     asyncio.run(_run())
 
 
-def test_live_entry_keeps_tracked_position_when_emergency_close_fails(caplog) -> None:
+def test_live_entry_records_close_when_emergency_close_verifies_both_legs_flat(caplog) -> None:
     async def _run() -> None:
         now = datetime.now(UTC)
         long_quote = _quote(
@@ -627,13 +627,12 @@ def test_live_entry_keeps_tracked_position_when_emergency_close_fails(caplog) ->
             now=now,
         )
 
-        position = engine.open_positions_by_symbol["BTCUSDT"]
-        assert position.entry_long_price == 100.05
-        assert position.entry_short_price == 101.0
+        assert "BTCUSDT" not in engine.open_positions_by_symbol
         assert execution_service.stop_calls == 1
         assert execution_service.exit_calls == 1
-        assert opportunity_store.records == []
+        assert len(opportunity_store.records) == 1
+        assert opportunity_store.records[0].close_reason == "stop_setup_failed"
 
     caplog.set_level(logging.CRITICAL)
     asyncio.run(_run())
-    assert any("LIVE position still open after protective-stop failure" in record.message for record in caplog.records)
+    assert not any("LIVE position still open after protective-stop failure" in record.message for record in caplog.records)

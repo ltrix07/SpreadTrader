@@ -86,6 +86,7 @@ class MeanRevPosition:
     short_stop_trigger_price: float = 0.0
     entry_long_funding: FundingInfo | None = None
     entry_short_funding: FundingInfo | None = None
+    close_attempts: int = 0
 
 
 @dataclass(slots=True)
@@ -110,6 +111,7 @@ class PendingMrEntry:
 
 class MeanReversionEngine:
     _FALLBACK_FEE_PCT = 0.10  # Conservative fallback for unknown exchanges.
+    _MAX_LIVE_CLOSE_ATTEMPTS = 3
 
     def __init__(
         self,
@@ -716,6 +718,295 @@ class MeanReversionEngine:
         position.entry_long_funding = await self._get_funding_info(position.long_exchange, position.symbol)
         position.entry_short_funding = await self._get_funding_info(position.short_exchange, position.symbol)
 
+    async def _recover_entry_leg(
+        self,
+        *,
+        symbol: str,
+        exchange: ExchangeName,
+        leg_label: str,
+        parsed_price: float,
+        parsed_qty: Decimal,
+    ) -> tuple[float, Decimal] | None:
+        if parsed_price > 0 and parsed_qty > 0:
+            return parsed_price, parsed_qty
+
+        self.log.warning(
+            "mr entry | %s | %s order parse degraded (price=%s qty=%s), checking actual position",
+            symbol,
+            leg_label,
+            parsed_price,
+            parsed_qty,
+        )
+        try:
+            live_position = await self.execution_service.clients[exchange].get_position(symbol)
+        except Exception as exc:
+            self.log.critical(
+                "mr entry | %s | %s get_position failed during recovery | %s",
+                symbol,
+                leg_label,
+                exc,
+            )
+            return None
+
+        recovered_qty = abs(live_position.size)
+        recovered_price = float(live_position.entry_price)
+        if recovered_qty > 0 and recovered_price > 0:
+            self.log.info(
+                "mr entry | %s | recovered from get_position | %s_qty=%s %s_price=%s",
+                symbol,
+                leg_label,
+                recovered_qty,
+                leg_label,
+                recovered_price,
+            )
+            return recovered_price, recovered_qty
+
+        self.log.critical(
+            "mr entry | %s | %s order returned zero and no position found on exchange | aborting",
+            symbol,
+            leg_label,
+        )
+        return None
+
+    async def _cleanup_failed_live_entry(
+        self,
+        *,
+        symbol: str,
+        long_exchange: ExchangeName,
+        short_exchange: ExchangeName,
+        long_qty: Decimal,
+        short_qty: Decimal,
+    ) -> None:
+        close_tasks: list[asyncio.Task[object]] = []
+        if long_qty > 0:
+            close_tasks.append(asyncio.create_task(
+                self.execution_service.clients[long_exchange].place_market_order(
+                    symbol,
+                    "sell",
+                    long_qty,
+                    close=True,
+                )
+            ))
+        if short_qty > 0:
+            close_tasks.append(asyncio.create_task(
+                self.execution_service.clients[short_exchange].place_market_order(
+                    symbol,
+                    "buy",
+                    short_qty,
+                    close=True,
+                )
+            ))
+        if not close_tasks:
+            return
+
+        results = await asyncio.gather(*close_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                self.log.critical(
+                    "mr entry cleanup failed | %s | %s | manual intervention may be required",
+                    symbol,
+                    result,
+                )
+
+    async def _get_exchange_position_safe(
+        self,
+        *,
+        exchange: ExchangeName,
+        symbol: str,
+    ) -> PositionInfo | None:
+        try:
+            return await self.execution_service.clients[exchange].get_position(symbol)
+        except Exception as exc:
+            self.log.warning(
+                "position check failed | %s %s | %s",
+                exchange.value,
+                symbol,
+                exc,
+            )
+            return None
+
+    async def _resolve_live_close_quantities(self, position: MeanRevPosition) -> tuple[Decimal, Decimal]:
+        long_qty = position.actual_qty_long or Decimal("0")
+        short_qty = position.actual_qty_short or Decimal("0")
+        needs_lookup = long_qty <= 0 or short_qty <= 0
+        if not needs_lookup:
+            return long_qty, short_qty
+
+        long_pos, short_pos = await asyncio.gather(
+            self._get_exchange_position_safe(exchange=position.long_exchange, symbol=position.symbol),
+            self._get_exchange_position_safe(exchange=position.short_exchange, symbol=position.symbol),
+        )
+        if long_pos is not None and abs(long_pos.size) > 0:
+            long_qty = abs(long_pos.size)
+            position.actual_qty_long = long_qty
+        if short_pos is not None and abs(short_pos.size) > 0:
+            short_qty = abs(short_pos.size)
+            position.actual_qty_short = short_qty
+        return long_qty, short_qty
+
+    async def _resolve_flat_exit_leg(
+        self,
+        *,
+        notional_usdt: float,
+        exchange: ExchangeName,
+        symbol: str,
+        trigger_order_id: str,
+        stop_trigger_price: float,
+        entry_price: float,
+    ) -> tuple[float, float, float]:
+        trigger_fill = None
+        get_trigger_fill_result = getattr(self.execution_service, "get_trigger_fill_result", None)
+        if callable(get_trigger_fill_result):
+            trigger_fill = await get_trigger_fill_result(
+                exchange=exchange,
+                symbol=symbol,
+                trigger_order_id=trigger_order_id,
+            )
+        if trigger_fill is not None:
+            return float(trigger_fill.avg_price), float(trigger_fill.fee), 0.0
+        return (
+            stop_trigger_price or entry_price,
+            _one_leg_fee_usdt(notional_usdt=notional_usdt, fee_pct=self._get_fee_pct(exchange)),
+            _one_leg_slippage_usdt(
+                notional_usdt=notional_usdt,
+                slippage_buffer_pct=self.settings.slippage_buffer_pct,
+            ),
+        )
+
+    async def _recover_live_exit_result(
+        self,
+        *,
+        position: MeanRevPosition,
+        long_quote: Quote | None,
+        short_quote: Quote | None,
+        failure: Exception,
+    ) -> tuple[float, float, float, float, float] | None:
+        self.log.warning(
+            "exit order failed, checking actual exchange positions | %s | %s",
+            position.symbol,
+            failure,
+        )
+        long_pos, short_pos = await asyncio.gather(
+            self._get_exchange_position_safe(exchange=position.long_exchange, symbol=position.symbol),
+            self._get_exchange_position_safe(exchange=position.short_exchange, symbol=position.symbol),
+        )
+        long_open = long_pos is not None and abs(long_pos.size) > 0
+        short_open = short_pos is not None and abs(short_pos.size) > 0
+
+        long_result: OrderResult | None = None
+        short_result: OrderResult | None = None
+        if long_open or short_open:
+            self.log.warning(
+                "exit verification found live exposure | %s | long_size=%s short_size=%s | attempting direct cleanup",
+                position.symbol,
+                long_pos.size if long_pos is not None else "unknown",
+                short_pos.size if short_pos is not None else "unknown",
+            )
+            close_tasks: list[asyncio.Task[OrderResult]] = []
+            close_legs: list[str] = []
+            if long_open and long_pos is not None:
+                close_legs.append("long")
+                close_tasks.append(asyncio.create_task(
+                    self.execution_service.clients[position.long_exchange].place_market_order(
+                        position.symbol,
+                        "sell" if long_pos.size > 0 else "buy",
+                        abs(long_pos.size),
+                        close=True,
+                    )
+                ))
+            if short_open and short_pos is not None:
+                close_legs.append("short")
+                close_tasks.append(asyncio.create_task(
+                    self.execution_service.clients[position.short_exchange].place_market_order(
+                        position.symbol,
+                        "sell" if short_pos.size > 0 else "buy",
+                        abs(short_pos.size),
+                        close=True,
+                    )
+                ))
+
+            results = await asyncio.gather(*close_tasks, return_exceptions=True)
+            for leg, result in zip(close_legs, results):
+                if isinstance(result, Exception):
+                    self.log.critical(
+                        "direct %s cleanup failed | %s | %s",
+                        leg,
+                        position.symbol,
+                        result,
+                    )
+                    continue
+                if leg == "long":
+                    long_result = result
+                else:
+                    short_result = result
+
+            long_pos, short_pos = await asyncio.gather(
+                self._get_exchange_position_safe(exchange=position.long_exchange, symbol=position.symbol),
+                self._get_exchange_position_safe(exchange=position.short_exchange, symbol=position.symbol),
+            )
+            long_open = long_pos is not None and abs(long_pos.size) > 0
+            short_open = short_pos is not None and abs(short_pos.size) > 0
+            if long_open or short_open:
+                return None
+
+        long_price, long_fee, long_slippage = await self._resolve_flat_exit_leg(
+            notional_usdt=position.notional_usdt,
+            exchange=position.long_exchange,
+            symbol=position.symbol,
+            trigger_order_id=position.long_stop_order_id,
+            stop_trigger_price=position.long_stop_trigger_price,
+            entry_price=position.entry_long_price,
+        )
+        short_price, short_fee, short_slippage = await self._resolve_flat_exit_leg(
+            notional_usdt=position.notional_usdt,
+            exchange=position.short_exchange,
+            symbol=position.symbol,
+            trigger_order_id=position.short_stop_order_id,
+            stop_trigger_price=position.short_stop_trigger_price,
+            entry_price=position.entry_short_price,
+        )
+        if long_result is not None:
+            long_price = float(long_result.avg_price)
+            long_fee = float(long_result.fee)
+            long_slippage = 0.0
+        if short_result is not None:
+            short_price = float(short_result.avg_price)
+            short_fee = float(short_result.fee)
+            short_slippage = 0.0
+
+        if long_quote is None or short_quote is None:
+            exit_spread_pct = position.entry_spread_pct
+        else:
+            exit_spread_pct = _directional_spread_pct(
+                ask_long=long_quote.best_ask_price,
+                bid_short=short_quote.best_bid_price,
+            )
+        if long_result is None and short_result is None:
+            self.log.info("position already closed (exchange stop triggered) | %s", position.symbol)
+        return (
+            long_price,
+            short_price,
+            long_fee + short_fee,
+            long_slippage + short_slippage,
+            exit_spread_pct,
+        )
+
+    def _handle_failed_close_attempt(self, position: MeanRevPosition) -> None:
+        if position.close_attempts >= self._MAX_LIVE_CLOSE_ATTEMPTS:
+            self.open_positions_by_symbol.pop(position.symbol, None)
+            self.log.critical(
+                "LIVE close retries exhausted | %s | attempts=%d | manual intervention required, position removed from tracking",
+                position.symbol,
+                position.close_attempts,
+            )
+            return
+        self.log.critical(
+            "EXIT FAILED and position still open | %s | attempt=%d/%d | MANUAL INTERVENTION",
+            position.symbol,
+            position.close_attempts,
+            self._MAX_LIVE_CLOSE_ATTEMPTS,
+        )
+
     def _schedule_close(
         self,
         *,
@@ -1114,6 +1405,31 @@ class MeanReversionEngine:
                 except Exception as exc:
                     self.log.error("LIVE entry failed | %s | %s", symbol, exc)
                     return
+                recovered_long = await self._recover_entry_leg(
+                    symbol=symbol,
+                    exchange=current.long_exchange,
+                    leg_label="long",
+                    parsed_price=entry_long_price,
+                    parsed_qty=actual_qty_long,
+                )
+                recovered_short = await self._recover_entry_leg(
+                    symbol=symbol,
+                    exchange=current.short_exchange,
+                    leg_label="short",
+                    parsed_price=entry_short_price,
+                    parsed_qty=actual_qty_short,
+                )
+                if recovered_long is None or recovered_short is None:
+                    await self._cleanup_failed_live_entry(
+                        symbol=symbol,
+                        long_exchange=current.long_exchange,
+                        short_exchange=current.short_exchange,
+                        long_qty=recovered_long[1] if recovered_long is not None else Decimal("0"),
+                        short_qty=recovered_short[1] if recovered_short is not None else Decimal("0"),
+                    )
+                    return
+                entry_long_price, actual_qty_long = recovered_long
+                entry_short_price, actual_qty_short = recovered_short
             else:
                 entry_long_price = float(long_quote.best_ask_price)
                 entry_short_price = float(short_quote.best_bid_price)
@@ -1224,12 +1540,10 @@ class MeanReversionEngine:
     ) -> None:
         now = self._clock()
         if self.live_mode:
+            position.close_attempts += 1
             await self._hydrate_position_funding_if_missing(position)
             if self.execution_service is None:
                 self.log.critical("LIVE exit failed | %s | missing execution service", position.symbol)
-                return
-            if position.actual_qty_long is None or position.actual_qty_short is None:
-                self.log.critical("LIVE exit failed | %s | missing filled quantities", position.symbol)
                 return
 
             await self.execution_service.cancel_protective_stops(
@@ -1240,17 +1554,35 @@ class MeanReversionEngine:
                 short_stop_id=position.short_stop_order_id,
             )
 
+            long_qty, short_qty = await self._resolve_live_close_quantities(position)
             try:
+                if long_qty <= 0 or short_qty <= 0:
+                    raise ExecutionError(
+                        f"resolved close quantities invalid: long_qty={long_qty} short_qty={short_qty}"
+                    )
                 spread_result = await self.execution_service.execute_spread_exit(
                     symbol=position.symbol,
                     long_exchange=position.long_exchange,
                     short_exchange=position.short_exchange,
-                    long_qty=position.actual_qty_long,
-                    short_qty=position.actual_qty_short,
+                    long_qty=long_qty,
+                    short_qty=short_qty,
                 )
+            except Exception as exc:
+                recovered = await self._recover_live_exit_result(
+                    position=position,
+                    long_quote=long_quote,
+                    short_quote=short_quote,
+                    failure=exc,
+                )
+                if recovered is None:
+                    self._handle_failed_close_attempt(position)
+                    return
+                exit_long_price, exit_short_price, exit_fees_usdt, exit_slippage_usdt, exit_spread_pct = recovered
+            else:
                 exit_long_price = float(spread_result.long_order.avg_price)
                 exit_short_price = float(spread_result.short_order.avg_price)
-                actual_exit_fees = float(spread_result.long_order.fee + spread_result.short_order.fee)
+                exit_fees_usdt = float(spread_result.long_order.fee + spread_result.short_order.fee)
+                exit_slippage_usdt = 0.0
                 if long_quote is None or short_quote is None:
                     exit_spread_pct = position.entry_spread_pct
                 else:
@@ -1258,82 +1590,6 @@ class MeanReversionEngine:
                         ask_long=long_quote.best_ask_price,
                         bid_short=short_quote.best_bid_price,
                     )
-                exit_fees_usdt = actual_exit_fees
-                exit_slippage_usdt = 0.0
-            except ExecutionError as exc:
-                self.log.warning(
-                    "exit order failed, checking if position closed by exchange stop | %s | %s",
-                    position.symbol,
-                    exc,
-                )
-                try:
-                    long_pos = await self.execution_service.clients[position.long_exchange].get_position(position.symbol)
-                    short_pos = await self.execution_service.clients[position.short_exchange].get_position(position.symbol)
-                    if float(long_pos.size) == 0.0 and float(short_pos.size) == 0.0:
-                        self.log.info("position already closed (exchange stop triggered) | %s", position.symbol)
-                        long_stop_result, short_stop_result = await asyncio.gather(
-                            self.execution_service.get_trigger_fill_result(
-                                exchange=position.long_exchange,
-                                symbol=position.symbol,
-                                trigger_order_id=position.long_stop_order_id,
-                            ),
-                            self.execution_service.get_trigger_fill_result(
-                                exchange=position.short_exchange,
-                                symbol=position.symbol,
-                                trigger_order_id=position.short_stop_order_id,
-                            ),
-                        )
-                        recovered_stop_fills = long_stop_result is not None and short_stop_result is not None
-
-                        exit_long_price = float(
-                            long_stop_result.avg_price if long_stop_result is not None
-                            else position.long_stop_trigger_price or position.entry_long_price
-                        )
-                        exit_short_price = float(
-                            short_stop_result.avg_price if short_stop_result is not None
-                            else position.short_stop_trigger_price or position.entry_short_price
-                        )
-
-                        if recovered_stop_fills:
-                            exit_fees_usdt = float(long_stop_result.fee + short_stop_result.fee)
-                            exit_slippage_usdt = 0.0
-                        else:
-                            self.log.warning(
-                                "stop-trigger fill details unavailable | %s | using stop trigger prices as fallback",
-                                position.symbol,
-                            )
-                            exit_fees_usdt = _one_side_fees_usdt(
-                                notional_usdt=position.notional_usdt,
-                                fee_long_pct=self._get_fee_pct(position.long_exchange),
-                                fee_short_pct=self._get_fee_pct(position.short_exchange),
-                            )
-                            exit_slippage_usdt = _one_side_slippage_usdt(
-                                notional_usdt=position.notional_usdt,
-                                slippage_buffer_pct=self.settings.slippage_buffer_pct,
-                            )
-
-                        if long_quote is None or short_quote is None:
-                            exit_spread_pct = position.entry_spread_pct
-                        else:
-                            exit_spread_pct = _directional_spread_pct(
-                                ask_long=long_quote.best_ask_price,
-                                bid_short=short_quote.best_bid_price,
-                            )
-                    else:
-                        self.log.critical(
-                            "EXIT FAILED and position still open | %s | MANUAL INTERVENTION",
-                            position.symbol,
-                        )
-                        return
-                except Exception:
-                    self.log.critical(
-                        "EXIT FAILED, could not verify position state | %s | MANUAL INTERVENTION",
-                        position.symbol,
-                    )
-                    return
-            except Exception as exc:
-                self.log.critical("LIVE exit failed | %s | %s - POSITION STILL OPEN", position.symbol, exc)
-                return
         else:
             if long_quote is None or short_quote is None:
                 exit_long_price = position.entry_long_price
@@ -1472,6 +1728,14 @@ def _one_side_fees_usdt(*, notional_usdt: float, fee_long_pct: float, fee_short_
 def _one_side_slippage_usdt(*, notional_usdt: float, slippage_buffer_pct: float) -> float:
     roundtrip_slippage = (2.0 * notional_usdt) * (slippage_buffer_pct / 100.0)
     return roundtrip_slippage / 2.0
+
+
+def _one_leg_fee_usdt(*, notional_usdt: float, fee_pct: float) -> float:
+    return notional_usdt * fee_pct / 100.0
+
+
+def _one_leg_slippage_usdt(*, notional_usdt: float, slippage_buffer_pct: float) -> float:
+    return _one_side_slippage_usdt(notional_usdt=notional_usdt, slippage_buffer_pct=slippage_buffer_pct) / 2.0
 
 
 def _bbo_walk_pct(*, long_quote: Quote, short_quote: Quote) -> float:

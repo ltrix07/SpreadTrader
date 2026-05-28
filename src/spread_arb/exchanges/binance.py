@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -178,23 +179,85 @@ class BinanceExchange(ExchangeClient):
         }
         if close:
             params["reduceOnly"] = "true"
-        data = await self._signed_request("POST", "/fapi/v1/order", params)
+        initial_data = await self._signed_request("POST", "/fapi/v1/order", params)
+        order_id = str(initial_data.get("orderId", ""))
+        data = initial_data
+        if order_id:
+            data = await self._wait_for_fill(symbol, order_id) or initial_data
         # FULL response includes 'fills' array with per-fill commission.
+        return self._parse_order_response(data, symbol=symbol, side=side, fallback_fee_source=initial_data)
+
+    async def _get_order(self, symbol: str, order_id: str) -> dict:
+        bn_symbol = self._to_binance_symbol(symbol)
+        return await self._signed_request(
+            "GET",
+            "/fapi/v1/order",
+            {
+                "symbol": bn_symbol,
+                "orderId": order_id,
+            },
+        )
+
+    async def _wait_for_fill(
+        self,
+        symbol: str,
+        order_id: str,
+        timeout_sec: float = 5.0,
+        poll_interval_sec: float = 0.2,
+    ) -> dict:
+        deadline = time.monotonic() + timeout_sec
+        last_response: dict = {}
+
+        while time.monotonic() < deadline:
+            try:
+                response = await self._get_order(symbol, order_id)
+                last_response = response
+                status = str(response.get("status", "")).upper()
+                if status in {"FILLED", "EXPIRED", "CANCELED", "REJECTED"}:
+                    return response
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("poll order failed | %s %s | %s", symbol, order_id, exc)
+            await asyncio.sleep(poll_interval_sec)
+
+        self.log.warning(
+            "order poll timeout | %s %s | last_status=%s executedQty=%s",
+            symbol,
+            order_id,
+            last_response.get("status"),
+            last_response.get("executedQty"),
+        )
+        return last_response
+
+    def _parse_order_response(
+        self,
+        response: dict,
+        *,
+        symbol: str,
+        side: str,
+        fallback_fee_source: dict | None = None,
+    ) -> OrderResult:
         total_fee = Decimal("0")
-        for fill in data.get("fills", []):
+        fee_source = response if response.get("fills") else (fallback_fee_source or response)
+        for fill in fee_source.get("fills", []):
             total_fee += Decimal(fill.get("commission", "0")).copy_abs()
+        exchange_filled_qty = Decimal(str(response.get("executedQty", "0")))
+        filled_qty = self._to_canonical_qty(symbol, exchange_filled_qty)
+        avg_price = Decimal(str(response.get("avgPrice", "0")))
+        cum_quote = Decimal(str(response.get("cumQuote", "0")))
+        if avg_price <= 0 and exchange_filled_qty > 0 and cum_quote > 0:
+            avg_price = cum_quote / exchange_filled_qty
         return OrderResult(
             exchange=self.name,
             symbol=symbol,
             side=side.lower(),
-            filled_qty=self._to_canonical_qty(symbol, Decimal(data.get("executedQty", "0"))),
-            avg_price=Decimal(data.get("avgPrice", "0")),
+            filled_qty=filled_qty,
+            avg_price=avg_price,
             fee=total_fee,
             fee_currency="USDT",
-            order_id=str(data.get("orderId", "")),
-            timestamp=datetime.fromtimestamp(data.get("updateTime", timestamp_ms()) / 1000, tz=UTC),
-            is_partial=data.get("status") != "FILLED",
-            raw_response=data,
+            order_id=str(response.get("orderId", "")),
+            timestamp=datetime.fromtimestamp(response.get("updateTime", timestamp_ms()) / 1000, tz=UTC),
+            is_partial=response.get("status") != "FILLED",
+            raw_response=response,
         )
 
     async def place_stop_market_order(
